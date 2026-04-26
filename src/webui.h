@@ -48,6 +48,11 @@ body{font-family:'Segoe UI',Tahoma,sans-serif;background:radial-gradient(circle 
 .form-group input:focus,.form-group select:focus{border-color:var(--brand);outline:none;box-shadow:0 0 0 4px rgba(19,103,209,.12)}
 .row{display:flex;gap:12px}
 .row .form-group{flex:1}
+.checkbox-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;margin-top:6px}
+.checkbox-item{display:flex;align-items:center;gap:8px;padding:8px 10px;border:1px solid #dce5f2;border-radius:12px;background:#f8fbff;font-size:13px;color:#334155}
+.checkbox-item input{width:auto;margin:0}
+.inline-actions{display:flex;gap:8px;flex-wrap:wrap}
+.session-id{font-family:Consolas,'Courier New',monospace;font-size:12px;word-break:break-all}
 .btn{padding:10px 15px;border:none;border-radius:12px;font-size:14px;cursor:pointer;display:inline-flex;align-items:center;gap:6px;transition:transform .12s ease,box-shadow .12s ease,background .12s ease}
 .btn:hover{transform:translateY(-1px);box-shadow:0 8px 16px rgba(15,23,42,.08)}
 .btn-primary{background:var(--brand);color:#fff}
@@ -188,6 +193,16 @@ body{font-family:'Segoe UI',Tahoma,sans-serif;background:radial-gradient(circle 
     </div>
 
     <div class="card">
+      <div class="provider-header">
+        <div>
+          <h2>会话概览</h2>
+          <div class="card-subtitle">按 Claude Code 会话维度聚合请求、活跃流、错误和 count_tokens 调用。</div>
+        </div>
+      </div>
+      <div id="sessionsContainer" class="empty">当前还没有会话级监控数据。</div>
+    </div>
+
+    <div class="card">
       <h2>通用设置</h2>
       <div class="row">
         <div class="form-group">
@@ -209,6 +224,16 @@ body{font-family:'Segoe UI',Tahoma,sans-serif;background:radial-gradient(circle 
           <div class="tiny" style="padding-top:10px">`0` 表示不设上限，网关会按需动态扩容；大于 `0` 时按固定工作线程启动。这个值在下次启动时生效。</div>
         </div>
       </div>
+      <div class="row">
+        <div class="form-group">
+          <label>Admin Token</label>
+          <input type="password" id="adminToken" value="" onchange="markUnsaved()" placeholder="可选；留空表示不启用控制面鉴权">
+        </div>
+        <div class="form-group">
+          <label>说明</label>
+          <div class="tiny" style="padding-top:10px">启用后，<code>/api/config</code>、<code>/api/monitor</code>、<code>/api/config/test</code> 都需要浏览器携带控制面令牌。已保存的值会以脱敏形式显示。</div>
+        </div>
+      </div>
     </div>
 
     <div class="card">
@@ -224,6 +249,29 @@ body{font-family:'Segoe UI',Tahoma,sans-serif;background:radial-gradient(circle 
     <div class="card">
       <div class="provider-header">
         <div>
+          <h2>控制面访问</h2>
+          <div class="card-subtitle">如果启用了 admin token，在这里为当前浏览器会话设置访问令牌。</div>
+        </div>
+      </div>
+      <div class="row">
+        <div class="form-group">
+          <label>当前访问令牌</label>
+          <input type="password" id="accessTokenInput" placeholder="未设置时留空">
+        </div>
+        <div class="form-group">
+          <label>状态</label>
+          <div class="tiny" id="accessTokenState" style="padding-top:10px">未设置控制面访问令牌。</div>
+        </div>
+      </div>
+      <div class="inline-actions">
+        <button class="btn btn-primary btn-sm" onclick="applyAccessToken()">应用令牌</button>
+        <button class="btn btn-outline btn-sm" onclick="clearAccessToken()">清除令牌</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="provider-header">
+        <div>
           <h2>请求计数</h2>
           <div class="card-subtitle">累计统计从当前进程启动时开始计算。</div>
         </div>
@@ -234,6 +282,15 @@ body{font-family:'Segoe UI',Tahoma,sans-serif;background:radial-gradient(circle 
         </thead>
         <tbody id="countersTableBody"></tbody>
       </table>
+    </div>
+
+    <div class="card">
+      <div class="provider-header">
+        <h2>模型路由</h2>
+        <button class="btn btn-primary btn-sm" onclick="addModelRoute()">+ 添加路由</button>
+      </div>
+      <div class="card-subtitle">可为每个网关模型声明 capabilities，并设置请求覆盖项，例如 thinking 和 effort。</div>
+      <div id="modelsList"></div>
     </div>
 
     <div class="card">
@@ -278,10 +335,11 @@ body{font-family:'Segoe UI',Tahoma,sans-serif;background:radial-gradient(circle 
 <div id="toast"></div>
 
 <script>
-let config = {port:8080,bind:"127.0.0.1",thread_pool_size:8,providers:[],models:{},aliases:{},model_aliases:{}};
+let config = {port:8080,bind:"127.0.0.1",thread_pool_size:8,admin_token:"",providers:[],models:{},aliases:{},model_aliases:{}};
 let monitor = null;
 let unsaved = false;
 let monitorIntervalId = null;
+let controlPlaneToken = localStorage.getItem('gateway_admin_token') || '';
 
 function toast(msg, type="info") {
   const t = document.getElementById('toast');
@@ -318,9 +376,73 @@ function formatTime(ms) {
   return new Date(ms).toLocaleString('zh-CN', {hour12:false});
 }
 
+function normalizeCapabilities(capabilities) {
+  const value = capabilities && typeof capabilities === 'object' ? capabilities : {};
+  return {
+    tools: Boolean(value.tools),
+    streaming: Boolean(value.streaming),
+    thinking: Boolean(value.thinking),
+    adaptive_thinking: Boolean(value.adaptive_thinking),
+    interleaved_thinking: Boolean(value.interleaved_thinking),
+    count_tokens: Boolean(value.count_tokens)
+  };
+}
+
+function normalizeModel(model, modelId = '') {
+  const value = model && typeof model === 'object' ? {...model} : {};
+  const thinkingType = value.request_overrides?.thinking?.type || value.thinking || '';
+  const effort = value.request_overrides?.effort || value.effort || '';
+  value.id = modelId || value.id || '';
+  value.provider = String(value.provider || '').trim();
+  value.upstream_model = String(value.upstream_model || '').trim();
+  value.protocol = String(value.protocol || '').trim();
+  value.role = String(value.role || '').trim();
+  value.thinking = thinkingType;
+  value.effort = effort;
+  value.capabilities = normalizeCapabilities(value.capabilities);
+  value.request_overrides = {};
+  if (thinkingType) value.request_overrides.thinking = {type: thinkingType};
+  if (effort) value.request_overrides.effort = effort;
+  return value;
+}
+
+function getControlPlaneHeaders(extraHeaders = {}) {
+  const headers = {...extraHeaders};
+  if (controlPlaneToken) {
+    headers['X-Gateway-Admin-Token'] = controlPlaneToken;
+  }
+  return headers;
+}
+
+async function gatewayFetch(url, options = {}) {
+  return fetch(url, {...options, headers: getControlPlaneHeaders(options.headers || {})});
+}
+
+function updateAccessTokenState(message, tone = 'muted') {
+  const el = document.getElementById('accessTokenState');
+  if (!el) return;
+  el.textContent = message;
+  el.style.color = tone === 'danger' ? 'var(--danger)' : tone === 'success' ? 'var(--success)' : 'var(--muted)';
+}
+
+function syncAccessTokenInput() {
+  const input = document.getElementById('accessTokenInput');
+  if (input) input.value = controlPlaneToken;
+  updateAccessTokenState(controlPlaneToken ? '已为当前浏览器会话设置控制面令牌。' : '未设置控制面访问令牌。', controlPlaneToken ? 'success' : 'muted');
+}
+
+function handleAuthFailure(source) {
+  updateAccessTokenState(`控制面拒绝了 ${source} 请求，请检查访问令牌。`, 'danger');
+  setMonitorDisconnected('控制面需要有效令牌');
+}
+
 function ensureConfigShape() {
+  config.admin_token = String(config.admin_token || '');
   config.providers = Array.isArray(config.providers) ? config.providers : [];
   config.models = config.models && typeof config.models === 'object' ? config.models : {};
+  for (const [modelId, model] of Object.entries(config.models)) {
+    config.models[modelId] = normalizeModel(model, modelId);
+  }
   config.aliases = config.aliases && typeof config.aliases === 'object' ? config.aliases : {};
   const aliasMap = {};
   for (const [alias, modelId] of Object.entries(config.aliases)) {
@@ -366,6 +488,7 @@ function allocateModelId(providerId, upstreamModel, models) {
 function buildCanonicalPayload() {
   const port = parseInt(document.getElementById('port').value, 10) || 8080;
   const bind = document.getElementById('bind').value || '127.0.0.1';
+  const adminToken = document.getElementById('adminToken').value || '';
   const parsedThreadPoolSize = parseInt(document.getElementById('threadPoolSize').value, 10);
   const threadPoolSize = Number.isInteger(parsedThreadPoolSize) && parsedThreadPoolSize >= 0
     ? parsedThreadPoolSize
@@ -382,7 +505,18 @@ function buildCanonicalPayload() {
   const models = {};
   for (const [modelId, model] of Object.entries(config.models || {})) {
     if (!model || !model.provider || !model.upstream_model) continue;
-    models[modelId] = {...model, id: modelId};
+    const normalized = normalizeModel(model, modelId);
+    models[modelId] = {
+      id: modelId,
+      provider: normalized.provider,
+      upstream_model: normalized.upstream_model,
+      protocol: normalized.protocol,
+      role: normalized.role,
+      thinking: normalized.thinking,
+      effort: normalized.effort,
+      capabilities: {...normalized.capabilities},
+      request_overrides: {...normalized.request_overrides}
+    };
   }
 
   const aliases = {};
@@ -398,7 +532,12 @@ function buildCanonicalPayload() {
         id: modelId,
         provider: providerId,
         upstream_model: upstreamModel,
-        protocol: provider && provider.type ? provider.type : ''
+        protocol: provider && provider.type ? provider.type : '',
+        role: '',
+        thinking: '',
+        effort: '',
+        capabilities: normalizeCapabilities({}),
+        request_overrides: {}
       };
     }
     aliases[alias] = modelId;
@@ -409,6 +548,7 @@ function buildCanonicalPayload() {
     port,
     bind,
     thread_pool_size: threadPoolSize,
+    admin_token: adminToken,
     providers,
     models,
     aliases,
@@ -422,7 +562,11 @@ function getAliasEntries() {
 
 async function loadConfig(showToast = false) {
   try {
-    const r = await fetch('/api/config');
+    const r = await gatewayFetch('/api/config');
+    if (r.status === 401) {
+      handleAuthFailure('/api/config');
+      throw new Error('HTTP 401');
+    }
     if (!r.ok) throw new Error('HTTP ' + r.status);
     config = await r.json();
     ensureConfigShape();
@@ -430,8 +574,90 @@ async function loadConfig(showToast = false) {
     render();
     if (showToast) toast('配置已加载', 'info');
   } catch(e) {
-    toast('加载配置失败: ' + e.message, 'error');
+    if (e.message !== 'HTTP 401') {
+      toast('加载配置失败: ' + e.message, 'error');
+    }
   }
+}
+
+function providerOptionsHtml(selectedId) {
+  return config.providers.map(p =>
+    `<option value="${esc(p.id)}" ${p.id === selectedId ? 'selected' : ''}>${esc(p.name || p.id)}</option>`
+  ).join('');
+}
+
+function countAliasReferencesForModel(modelId) {
+  let count = 0;
+  for (const [, aliasModelId] of Object.entries(config.aliases || {})) {
+    if (aliasModelId === modelId) count += 1;
+  }
+  return count;
+}
+
+function renderModelRoutes() {
+  const list = document.getElementById('modelsList');
+  const modelEntries = Object.entries(config.models || {}).sort((a, b) => a[0].localeCompare(b[0], 'zh-CN'));
+  if (!modelEntries.length) {
+    list.innerHTML = '<div class="empty">当前还没有显式模型路由。添加别名时也会自动生成对应路由。</div>';
+    return;
+  }
+
+  const capabilityLabels = {
+    tools: 'Tools',
+    streaming: 'Streaming',
+    thinking: 'Thinking',
+    adaptive_thinking: 'Adaptive Thinking',
+    interleaved_thinking: 'Interleaved Thinking',
+    count_tokens: 'Count Tokens'
+  };
+
+  list.innerHTML = modelEntries.map(([modelId, rawModel]) => {
+    const model = normalizeModel(rawModel, modelId);
+    const aliasRefs = countAliasReferencesForModel(modelId);
+    return `
+      <div class="provider-item">
+        <div class="row">
+          <div class="form-group"><label>模型 ID</label><input value="${esc(modelId)}" onchange="renameModelRoute(${jsq(modelId)}, this.value)"></div>
+          <div class="form-group"><label>Provider</label><select onchange="updateModelField(${jsq(modelId)}, 'provider', this.value)">${providerOptionsHtml(model.provider)}</select></div>
+          <div class="form-group"><label>上游模型</label><input value="${esc(model.upstream_model)}" onchange="updateModelField(${jsq(modelId)}, 'upstream_model', this.value)"></div>
+        </div>
+        <div class="row">
+          <div class="form-group"><label>协议</label><select onchange="updateModelField(${jsq(modelId)}, 'protocol', this.value)">
+            <option value="" ${!model.protocol ? 'selected' : ''}>自动</option>
+            <option value="anthropic" ${model.protocol === 'anthropic' ? 'selected' : ''}>Anthropic</option>
+            <option value="openai" ${model.protocol === 'openai' ? 'selected' : ''}>OpenAI</option>
+          </select></div>
+          <div class="form-group"><label>角色</label><input value="${esc(model.role || '')}" onchange="updateModelField(${jsq(modelId)}, 'role', this.value)" placeholder="可选"></div>
+          <div class="form-group"><label>别名引用</label><div class="tiny" style="padding-top:10px">当前有 ${formatNumber(aliasRefs)} 个别名指向该路由。</div></div>
+        </div>
+        <div class="row">
+          <div class="form-group"><label>Thinking Override</label><select onchange="updateModelThinking(${jsq(modelId)}, this.value)">
+            <option value="" ${!model.thinking ? 'selected' : ''}>继承请求</option>
+            <option value="enabled" ${model.thinking === 'enabled' ? 'selected' : ''}>enabled</option>
+            <option value="disabled" ${model.thinking === 'disabled' ? 'selected' : ''}>disabled</option>
+          </select></div>
+          <div class="form-group"><label>Effort Override</label><input value="${esc(model.effort || '')}" onchange="updateModelEffort(${jsq(modelId)}, this.value)" placeholder="如: low / medium / high"></div>
+        </div>
+        <div class="form-group">
+          <label>Capabilities</label>
+          <div class="checkbox-grid">
+            ${Object.entries(capabilityLabels).map(([key, label]) => `
+              <label class="checkbox-item">
+                <input type="checkbox" ${model.capabilities[key] ? 'checked' : ''} onchange="updateModelCapability(${jsq(modelId)}, ${jsq(key)}, this.checked)">
+                <span>${esc(label)}</span>
+              </label>
+            `).join('')}
+          </div>
+        </div>
+        <div class="provider-actions">
+          <div class="tiny">Provider: ${esc(model.provider || '--')} · Upstream: ${esc(model.upstream_model || '--')}</div>
+          <div class="inline-actions">
+            <button class="btn btn-danger btn-sm" onclick="removeModelRoute(${jsq(modelId)})">删除路由</button>
+          </div>
+        </div>
+      </div>
+    `;
+  }).join('');
 }
 
 function render() {
@@ -439,7 +665,9 @@ function render() {
   document.getElementById('port').value = config.port || 8080;
   document.getElementById('bind').value = config.bind || '127.0.0.1';
   document.getElementById('threadPoolSize').value = Number.isInteger(config.thread_pool_size) ? config.thread_pool_size : 8;
+  document.getElementById('adminToken').value = config.admin_token || '';
   document.getElementById('listenerDisplay').textContent = `${config.bind || '127.0.0.1'}:${config.port || 8080}`;
+  syncAccessTokenInput();
 
   const list = document.getElementById('providersList');
   list.innerHTML = '';
@@ -481,6 +709,8 @@ function render() {
     list.innerHTML = '<div class="empty">当前还没有 Provider，先添加至少一个上游服务。</div>';
   }
 
+  renderModelRoutes();
+
   const sel = document.getElementById('newAliasProviderId');
   sel.innerHTML = config.providers.map((p,i) =>
     `<option value="${esc(p.id)}">${esc(p.name||p.id)}</option>`
@@ -512,6 +742,24 @@ function render() {
   if (!getAliasEntries().length) {
     alist.innerHTML = '<div class="empty">当前没有模型别名，Claude Code 将无法通过别名路由到上游模型。</div>';
   }
+}
+
+function applyAccessToken() {
+  controlPlaneToken = document.getElementById('accessTokenInput').value || '';
+  if (controlPlaneToken) {
+    localStorage.setItem('gateway_admin_token', controlPlaneToken);
+  } else {
+    localStorage.removeItem('gateway_admin_token');
+  }
+  syncAccessTokenInput();
+  refreshAll(true);
+}
+
+function clearAccessToken() {
+  controlPlaneToken = '';
+  localStorage.removeItem('gateway_admin_token');
+  syncAccessTokenInput();
+  toast('已清除浏览器中的控制面令牌', 'info');
 }
 
 function updateAliasModelsDropdown() {
@@ -551,6 +799,7 @@ function updateProvider(idx, field, val) {
     }
   }
   markUnsaved();
+  render();
 }
 
 function updateProviderModels(idx, val) {
@@ -568,10 +817,124 @@ function addProvider() {
 
 function removeProvider(idx) {
   const id = config.providers[idx].id;
+  const deletedModelIds = Object.entries(config.models || {})
+    .filter(([, model]) => model && model.provider === id)
+    .map(([modelId]) => modelId);
   for (const [k, v] of Object.entries(config.model_aliases)) {
     if (v.startsWith(id + ':')) delete config.model_aliases[k];
   }
+  for (const [alias, modelId] of Object.entries(config.aliases || {})) {
+    if (deletedModelIds.includes(modelId)) delete config.aliases[alias];
+  }
+  deletedModelIds.forEach(modelId => delete config.models[modelId]);
   config.providers.splice(idx, 1);
+  markUnsaved();
+  render();
+}
+
+function syncAliasesForModel(modelId) {
+  const model = normalizeModel(config.models[modelId], modelId);
+  config.models[modelId] = model;
+  for (const [alias, aliasModelId] of Object.entries(config.aliases || {})) {
+    if (aliasModelId === modelId) {
+      config.model_aliases[alias] = `${model.provider}:${model.upstream_model}`;
+    }
+  }
+}
+
+function addModelRoute() {
+  const provider = config.providers[0] || {id:'', type:''};
+  const upstreamModel = provider.models && provider.models.length ? provider.models[0] : '';
+  const modelId = allocateModelId(provider.id || 'model', upstreamModel || 'new-model', config.models || {});
+  config.models[modelId] = normalizeModel({
+    id: modelId,
+    provider: provider.id || '',
+    upstream_model: upstreamModel || '',
+    protocol: provider.type || '',
+    role: '',
+    thinking: '',
+    effort: '',
+    capabilities: {},
+    request_overrides: {}
+  }, modelId);
+  markUnsaved();
+  render();
+}
+
+function renameModelRoute(oldId, nextIdRaw) {
+  const nextId = String(nextIdRaw || '').trim();
+  if (!nextId || nextId === oldId) {
+    render();
+    return;
+  }
+  if (config.models[nextId]) {
+    toast('模型 ID 已存在', 'error');
+    render();
+    return;
+  }
+  config.models[nextId] = normalizeModel(config.models[oldId], nextId);
+  delete config.models[oldId];
+  for (const [alias, modelId] of Object.entries(config.aliases || {})) {
+    if (modelId === oldId) config.aliases[alias] = nextId;
+  }
+  markUnsaved();
+  render();
+}
+
+function updateModelField(modelId, field, value) {
+  const model = normalizeModel(config.models[modelId], modelId);
+  model[field] = value;
+  if (field === 'provider' && !model.protocol) {
+    const provider = config.providers.find(p => p.id === value);
+    model.protocol = provider ? provider.type : model.protocol;
+  }
+  config.models[modelId] = model;
+  if (field === 'provider' || field === 'upstream_model') {
+    syncAliasesForModel(modelId);
+  }
+  markUnsaved();
+  render();
+}
+
+function updateModelThinking(modelId, value) {
+  const model = normalizeModel(config.models[modelId], modelId);
+  model.thinking = value;
+  if (value) {
+    model.request_overrides.thinking = {type: value};
+  } else {
+    delete model.request_overrides.thinking;
+  }
+  config.models[modelId] = model;
+  markUnsaved();
+}
+
+function updateModelEffort(modelId, value) {
+  const model = normalizeModel(config.models[modelId], modelId);
+  model.effort = value;
+  if (value) {
+    model.request_overrides.effort = value;
+  } else {
+    delete model.request_overrides.effort;
+  }
+  config.models[modelId] = model;
+  markUnsaved();
+}
+
+function updateModelCapability(modelId, key, checked) {
+  const model = normalizeModel(config.models[modelId], modelId);
+  model.capabilities[key] = Boolean(checked);
+  config.models[modelId] = model;
+  markUnsaved();
+}
+
+function removeModelRoute(modelId) {
+  delete config.models[modelId];
+  for (const [alias, aliasModelId] of Object.entries(config.aliases || {})) {
+    if (aliasModelId === modelId) {
+      delete config.aliases[alias];
+      delete config.model_aliases[alias];
+    }
+  }
   markUnsaved();
   render();
 }
@@ -638,7 +1001,7 @@ function renderMonitor() {
   document.getElementById('streamOutcomeDisplay').textContent = `${formatNumber(counters.total_stream_completions)} / ${formatNumber(counters.total_stream_cancellations)}`;
   document.getElementById('streamOutcomeMeta').textContent = `断连 ${formatNumber(counters.total_stream_disconnects)}`;
   document.getElementById('errorDisplay').textContent = formatNumber(counters.total_request_errors);
-  document.getElementById('requestBreakdownDisplay').textContent = `普通 ${formatNumber(counters.total_nonstream_requests)} · 流式 ${formatNumber(counters.total_stream_requests)}`;
+  document.getElementById('requestBreakdownDisplay').textContent = `普通 ${formatNumber(counters.total_nonstream_requests)} · 流式 ${formatNumber(counters.total_stream_requests)} · 计数 ${formatNumber(counters.total_count_token_requests)}`;
   document.getElementById('refreshStamp').textContent = `最近刷新: ${new Date().toLocaleTimeString('zh-CN', {hour12:false})}`;
   document.getElementById('consoleModeBadge').textContent = runtime.console_visible ? '控制台: 前台' : '控制台: 后台';
   document.getElementById('configPathDisplay').textContent = runtime.config_path || '--';
@@ -658,6 +1021,7 @@ function renderMonitor() {
     ['total_requests', '累计请求', '从当前进程启动以来接收的全部 /v1/messages 请求'],
     ['total_nonstream_requests', '普通请求', '一次性返回完整 JSON 的请求数'],
     ['total_stream_requests', '流式请求', '开启 stream=true 的请求数'],
+    ['total_count_token_requests', 'Token 计数', '调用 /v1/messages/count_tokens 的次数'],
     ['total_request_errors', '错误请求', '返回 4xx/5xx 或流式启动失败的请求数'],
     ['total_stream_completions', '流完成', '流式输出自然完成'],
     ['total_stream_cancellations', '流取消', '主动取消或上游被中止的流'],
@@ -683,7 +1047,7 @@ function renderMonitor() {
     container.innerHTML = `
       <table class="table">
         <thead>
-          <tr><th>ID</th><th>模型</th><th>持续时间</th><th>缓冲</th><th>队列块</th><th>状态</th></tr>
+          <tr><th>ID</th><th>会话</th><th>模型</th><th>持续时间</th><th>缓冲</th><th>队列块</th><th>状态</th></tr>
         </thead>
         <tbody>
           ${streams.map(stream => {
@@ -691,6 +1055,7 @@ function renderMonitor() {
             return `
               <tr>
                 <td class="mono">${formatNumber(stream.id)}</td>
+                <td class="session-id">${esc(stream.session_id || '--')}</td>
                 <td class="mono">${esc(stream.model || '--')}</td>
                 <td>${formatDuration(stream.age_seconds)}</td>
                 <td>${formatBytes(stream.buffered_bytes)}</td>
@@ -702,18 +1067,53 @@ function renderMonitor() {
       </table>
     `;
   }
+
+  const sessions = Array.isArray(monitor.sessions) ? monitor.sessions : [];
+  const sessionsContainer = document.getElementById('sessionsContainer');
+  if (!sessions.length) {
+    sessionsContainer.className = 'empty';
+    sessionsContainer.textContent = '当前还没有会话级监控数据。';
+  } else {
+    sessionsContainer.className = '';
+    sessionsContainer.innerHTML = `
+      <table class="table">
+        <thead>
+          <tr><th>Session</th><th>最近模型</th><th>请求</th><th>流 / 普通 / 计数</th><th>活跃流</th><th>错误</th><th>最近活动</th></tr>
+        </thead>
+        <tbody>
+          ${sessions.map(session => `
+            <tr>
+              <td class="session-id">${esc(session.id || '--')}</td>
+              <td class="mono">${esc(session.last_model || '--')}</td>
+              <td>${formatNumber(session.total_requests)}</td>
+              <td>${formatNumber(session.total_stream_requests)} / ${formatNumber(session.total_nonstream_requests)} / ${formatNumber(session.total_count_token_requests)}</td>
+              <td>${formatNumber(session.active_streams)}</td>
+              <td>${formatNumber(session.total_errors)}</td>
+              <td>${formatTime(session.last_seen_unix_ms)}</td>
+            </tr>
+          `).join('')}
+        </tbody>
+      </table>
+    `;
+  }
 }
 
 async function loadMonitor(showToast = false) {
   try {
-    const r = await fetch('/api/monitor');
+    const r = await gatewayFetch('/api/monitor');
+    if (r.status === 401) {
+      handleAuthFailure('/api/monitor');
+      throw new Error('HTTP 401');
+    }
     if (!r.ok) throw new Error('HTTP ' + r.status);
     monitor = await r.json();
     renderMonitor();
     if (showToast) toast('监控数据已刷新', 'info');
   } catch (e) {
-    setMonitorDisconnected('监控接口不可达: ' + e.message);
-    if (showToast) toast('监控刷新失败: ' + e.message, 'error');
+    if (e.message !== 'HTTP 401') {
+      setMonitorDisconnected('监控接口不可达: ' + e.message);
+      if (showToast) toast('监控刷新失败: ' + e.message, 'error');
+    }
   }
 }
 
@@ -725,7 +1125,11 @@ async function refreshAll(showToast = false) {
 async function testProvider(providerId) {
   try {
     const params = new URLSearchParams({provider_id: providerId});
-    const r = await fetch('/api/config/test?' + params.toString());
+    const r = await gatewayFetch('/api/config/test?' + params.toString());
+    if (r.status === 401) {
+      handleAuthFailure('/api/config/test');
+      throw new Error('HTTP 401');
+    }
     const result = await r.json();
     if (!r.ok || result.status !== 'ok') {
       throw new Error(result.error || ('HTTP ' + r.status));
@@ -742,11 +1146,15 @@ async function saveConfig() {
   const btn = document.querySelector('.save-bar .btn-success');
   btn.disabled = true; btn.textContent = '保存中...';
   try {
-    const r = await fetch('/api/config', {
+    const r = await gatewayFetch('/api/config', {
       method:'POST',
       headers:{'Content-Type':'application/json'},
       body: JSON.stringify(payload)
     });
+    if (r.status === 401) {
+      handleAuthFailure('/api/config');
+      throw new Error('HTTP 401');
+    }
     if (!r.ok) throw new Error('HTTP ' + r.status);
     const result = await r.json();
     config = result;
@@ -757,7 +1165,9 @@ async function saveConfig() {
     render();
     await loadMonitor(false);
   } catch(e) {
-    toast('保存失败: ' + e.message, 'error');
+    if (e.message !== 'HTTP 401') {
+      toast('保存失败: ' + e.message, 'error');
+    }
   } finally {
     btn.disabled = false; btn.textContent = '保存配置';
   }

@@ -1,89 +1,107 @@
-# claudecode-provider-flater
+# claudecode-provider-flattener
 
-`claudecode-provider-flater` is a local gateway that flattens multiple upstream LLM providers into one Anthropic-compatible local provider for Claude Code.
+`claudecode-provider-flattener` is a Windows-first local gateway that makes multiple upstream providers look like one Anthropic-compatible provider for Claude Code.
 
-The core purpose of this repository is:
+Its job is simple: keep Claude Code pointed at one stable local endpoint, and let `/model` switch between different upstream vendors and upstream model IDs.
 
-> Wrap multiple providers behind a single local provider, so Claude Code can switch between them with `/model`.
+## Why this exists
 
-## What it does
+Claude Code works best when the local endpoint does not change. Real usage is messier:
 
-- Exposes a local Anthropic-compatible endpoint for Claude Code.
-- Routes requests to multiple upstream providers such as Anthropic-compatible or OpenAI-compatible backends.
-- Maps friendly local model aliases like `haiku`, `sonnet`, `opus`, or custom names to different upstream providers and upstream model IDs.
-- Lets Claude Code switch routes by using `/model <alias>` instead of rewriting provider settings every time.
-- Includes a local web control panel for configuration, connectivity checks, runtime monitoring, and active stream visibility.
-- Supports background launch, explicit foreground mode with `--show`, and a restart supervisor with `--daemon`.
+- one model might be served by an Anthropic-compatible gateway
+- another might only exist behind an OpenAI-compatible backend
+- a third route may need custom thinking defaults or capability declarations
 
-## Typical use case
+This gateway flattens those differences into one local Anthropic-compatible surface so Claude Code keeps working while you swap the real backend behind each alias.
 
-Instead of pointing Claude Code at one vendor directly, you point it at this local gateway:
+## Core capabilities
 
-- Claude Code talks to `http://127.0.0.1:9457`
-- The gateway receives the request
-- The selected local alias determines which upstream provider and upstream model to use
-- In Claude Code, you switch with `/model haiku`, `/model sonnet`, `/model opus`, or any custom alias you configured
+- Anthropic-compatible local API for Claude Code
+- Multi-provider routing across Anthropic-style and OpenAI-style backends
+- Alias-based switching through `/model <alias>`
+- Full-duplex streaming with downstream disconnect handling and upstream cancellation
+- `/v1/messages/count_tokens` support with upstream passthrough and local fallback estimation
+- Per-session monitoring keyed by `X-Claude-Code-Session-Id`
+- Local control panel for providers, model routes, aliases, capabilities, request overrides, and runtime telemetry
+- Background launch by default, foreground mode with `--show`, and restart supervision with `--daemon`
 
-This means one Claude Code setup can transparently route across multiple providers.
+## Quick start
 
-## Build
-
-### Windows with CMake
+### 1. Build
 
 ```powershell
 cmake -B build -S . -G "MinGW Makefiles"
 cmake --build build
 ```
 
-### Convenience script
+Or use the helper script:
 
 ```bash
 ./build.sh
 ```
 
-The launcher script for Windows is:
+### 2. Run the gateway
 
-```bat
-start.bat
+```powershell
+./build/model-gateway.exe
 ```
 
-## Install and run
+Useful modes:
 
-The project installs and runs from the user-scoped Claude directory:
-
-- Binary directory: `~/.claude/model-gateway/bin`
-- Config file: `~/.claude/model-gateway/config.json`
-
-### Start modes
-
-- Default: starts as a background worker and returns control to the shell.
-- `--show`: keeps the gateway in the current console.
-- `--daemon`: starts a supervisor that restarts the worker if it exits unexpectedly.
+- default: starts in the background and returns to the shell
+- `--show`: keep the gateway attached to the current console
+- `--daemon`: run a supervisor that restarts the worker after unexpected exits
 
 Examples:
 
 ```powershell
-./build/model-gateway.exe
 ./build/model-gateway.exe --show
 ./build/model-gateway.exe --daemon
 ./build/model-gateway.exe --show 9457
 ```
 
+The installed runtime uses the user-scoped Claude directory:
+
+- binary: `~/.claude/model-gateway/bin`
+- config: `~/.claude/model-gateway/config.json`
+
+### 3. Point Claude Code at the gateway
+
+For Claude Code, treat the gateway as your Anthropic endpoint and export the Anthropic environment variables before launching Claude Code:
+
+```powershell
+$env:ANTHROPIC_BASE_URL = "http://127.0.0.1:9457"
+$env:ANTHROPIC_AUTH_TOKEN = "local-gateway"
+```
+
+`ANTHROPIC_AUTH_TOKEN` only needs to be non-empty for Claude Code to initialize. The gateway itself authenticates to upstream providers using the keys stored in its own config.
+
+Then switch models inside Claude Code with local aliases:
+
+```text
+/model haiku
+/model sonnet
+/model opus
+```
+
+Those names are gateway aliases, not necessarily vendor model IDs.
+
 ## Configuration model
 
-The gateway uses three layers:
+The gateway uses three routing layers:
 
-- `providers`: upstream endpoints and API keys
-- `models`: gateway model definitions that bind a provider to a concrete upstream model name
-- `aliases`: short names that Claude Code can select with `/model`
+- `providers`: upstream endpoints and credentials
+- `models`: concrete gateway routes, each binding one provider to one upstream model
+- `aliases`: Claude Code-facing short names selected through `/model`
 
-Example shape:
+Example:
 
 ```json
 {
   "port": 9457,
   "bind": "127.0.0.1",
   "thread_pool_size": 8,
+  "admin_token": "optional-control-plane-token",
   "providers": [
     {
       "id": "zai",
@@ -107,80 +125,112 @@ Example shape:
       "id": "astron-code-latest",
       "provider": "zai",
       "upstream_model": "astron-code-latest",
-      "protocol": "anthropic"
-    },
-    "deepseek-v4-flash": {
-      "id": "deepseek-v4-flash",
-      "provider": "deepseek",
-      "upstream_model": "deepseek-v4-flash",
-      "protocol": "openai"
+      "protocol": "anthropic",
+      "capabilities": {
+        "tools": true,
+        "streaming": true,
+        "thinking": true,
+        "count_tokens": true
+      },
+      "request_overrides": {
+        "thinking": {"type": "enabled"},
+        "effort": "medium"
+      }
     }
   },
   "aliases": {
-    "opus": "astron-code-latest",
+    "sonnet": "astron-code-latest",
     "haiku": "deepseek-v4-flash"
   }
 }
 ```
 
-## Use with Claude Code
+Notes:
 
-### 1. Start the gateway
+- `thread_pool_size: 0` means unbounded mode
+- `admin_token` protects `/api/config`, `/api/config/test`, and `/api/monitor`
+- provider API keys and the admin token are masked in the control panel and preserved on save when the masked value is left unchanged
 
-Run the gateway locally so it listens on `127.0.0.1:9457` or your chosen port.
+## Claude Code compatibility matrix
 
-### 2. Point Claude Code to the local gateway
-
-Use the gateway as the local custom provider endpoint:
-
-```json
-{
-  "provider": "custom",
-  "customBaseUrl": "http://127.0.0.1:9457",
-  "model": "sonnet"
-}
-```
-
-### 3. Switch models inside Claude Code
-
-Once aliases are configured in the gateway, switch providers and upstream models from Claude Code with:
-
-```text
-/model haiku
-/model sonnet
-/model opus
-```
-
-Those alias names are local gateway aliases, not necessarily upstream vendor model IDs.
+| Surface | Status | Notes |
+| --- | --- | --- |
+| `POST /v1/messages` | Yes | Anthropic-compatible request/response surface |
+| Streaming SSE | Yes | Downstream disconnect detection and upstream cancellation included |
+| `POST /v1/messages/count_tokens` | Yes | Pass-through when available, local estimation fallback otherwise |
+| `GET /v1/models` | Yes | Alias and model metadata listing |
+| `anthropic-version` passthrough | Yes | Forwarded from Claude Code when present |
+| `anthropic-beta` passthrough | Yes | Forwarded to Anthropic-compatible upstreams |
+| `X-Claude-Code-Session-Id` tracking | Yes | Aggregated into the monitor dashboard |
+| Tool blocks and tool results | Yes | Anthropic ↔ OpenAI translation supported |
+| Thinking flags | Yes | Per-model override support via `request_overrides` |
 
 ## Control panel
 
-The gateway exposes a local web UI at:
+The web control panel lives at:
 
 ```text
 http://127.0.0.1:9457/
 ```
 
-The control panel supports:
+It supports:
 
-- editing providers, models, aliases, bind address, and thread pool size
-- testing provider connectivity
-- monitoring runtime counters
-- viewing active streams and buffering state
-- inspecting runtime file locations and monitor metadata
+- editing providers, model routes, aliases, bind address, thread pool size, and optional admin token
+- editing model capabilities and request overrides such as thinking and effort
+- masked secret handling for provider API keys and the control-plane token
+- provider connectivity testing
+- runtime counters, active stream state, buffered byte pressure, and thread-pool view
+- session-level aggregation including request counts, count-token calls, active streams, and errors
 
 ## Runtime APIs
 
-- `GET /` — web control panel
+- `GET /` — control panel
 - `GET /api/config` — current runtime config
 - `POST /api/config` — save config
-- `GET /api/config/test` — test one provider
-- `GET /api/monitor` — runtime monitor data
-- `GET /v1/models` — list model aliases and model metadata
+- `GET /api/config/test?provider_id=...` — test one provider
+- `GET /api/monitor` — runtime and session monitor data
+- `GET /v1/models` — list model aliases and metadata
 - `POST /v1/messages` — Anthropic-compatible messages endpoint
+- `POST /v1/messages/count_tokens` — token counting endpoint
 
-## Why this exists
+## Security notes
 
-Claude Code is most convenient when the local tool surface stays stable.
+This project is a local gateway, not a hardened internet-facing reverse proxy.
 
-This gateway keeps Claude Code pointed at one local provider while you change the actual upstream provider behind it using aliases and `/model`. That removes repeated provider reconfiguration and makes multi-provider experiments much easier.
+- Upstream API keys are stored in the user config file because the gateway must use them at runtime.
+- The control panel masks secrets on read and preserves them correctly on save.
+- Runtime APIs redact local absolute paths in monitor output.
+- You can protect the control plane with `admin_token`, but the data plane remains a local trusted interface.
+- There is no built-in TLS termination, user management, or encrypted secret store.
+
+If you need stronger guarantees, put this gateway behind a local-only firewall policy or an additional authenticated reverse proxy.
+
+## Comparison
+
+Compared with directly pointing Claude Code at one provider:
+
+- you keep one stable local endpoint
+- `/model` becomes the switch point instead of editing provider config repeatedly
+- Anthropic-compatible and OpenAI-compatible upstreams can coexist behind the same Claude Code session
+
+Compared with a generic API proxy:
+
+- this project is intentionally Claude Code-specific
+- the compatibility work is centered on Anthropic message semantics, Claude session headers, and `/model` alias routing
+- the control panel is built around provider flattening rather than general API gateway features
+
+## Releases
+
+GitHub Actions includes a Windows x64 release workflow. Tag a release with a `v*` tag such as `v1.0.0` and the workflow will:
+
+- build `model-gateway.exe` in Release mode
+- package the executable with the README and launcher helpers
+- upload the Windows x64 archive to the GitHub Release page
+
+## Roadmap
+
+- signed Windows release artifacts
+- packaged install helpers beyond the current binary drop-in flow
+- per-provider health scoring and smarter failover
+- stronger secret-storage options
+- broader cross-platform packaging

@@ -43,6 +43,76 @@ void finish_stream(const std::shared_ptr<StreamBuffer>& out_buf,
     }
     out_buf->cv.notify_all();
 }
+
+std::map<std::string, std::string> merge_request_headers(
+    std::map<std::string, std::string> headers,
+    const GatewayRequestContext& request_context) {
+    for (const auto& [name, value] : request_context.forwarded_headers) {
+        if (!value.empty()) {
+            headers[name] = value;
+        }
+    }
+    return headers;
+}
+
+size_t estimate_text_tokens(const std::string& text) {
+    if (text.empty()) {
+        return 0;
+    }
+    return (text.size() + 3) / 4;
+}
+
+size_t estimate_json_tokens(const json& value) {
+    if (value.is_string()) {
+        return estimate_text_tokens(value.get<std::string>());
+    }
+    return estimate_text_tokens(value.dump());
+}
+
+int estimate_input_tokens(const json& req) {
+    size_t tokens = 0;
+
+    if (req.contains("system")) {
+        tokens += estimate_json_tokens(req["system"]);
+    }
+
+    if (req.contains("messages") && req["messages"].is_array()) {
+        for (const auto& message : req["messages"]) {
+            tokens += 6;
+            tokens += estimate_text_tokens(message.value("role", ""));
+            if (message.contains("content")) {
+                tokens += estimate_json_tokens(message["content"]);
+            }
+        }
+    }
+
+    if (req.contains("tools")) {
+        tokens += estimate_json_tokens(req["tools"]);
+    }
+    if (req.contains("tool_choice")) {
+        tokens += estimate_json_tokens(req["tool_choice"]);
+    }
+
+    if (req.contains("metadata")) {
+        tokens += estimate_json_tokens(req["metadata"]);
+    }
+
+    return static_cast<int>(std::max<size_t>(1, tokens));
+}
+
+std::string resolved_thinking_override(const ModelConfig& model_cfg) {
+    if (!model_cfg.request_overrides.thinking_type.empty()) {
+        return model_cfg.request_overrides.thinking_type;
+    }
+    return model_cfg.thinking;
+}
+
+std::string resolved_effort_override(const ModelConfig& model_cfg) {
+    if (!model_cfg.request_overrides.effort.empty()) {
+        return model_cfg.request_overrides.effort;
+    }
+    return model_cfg.effort;
+}
 }
 
 // ─── Utility ────────────────────────────────────────────────────────────────
@@ -212,17 +282,20 @@ std::string AnthropicProvider::transformRequest(const json& anthropic_req,
     json req = anthropic_req;
     req["model"] = model_cfg.upstream_model;
 
-    if (model_cfg.thinking == "enabled") {
+    const std::string thinking_override = resolved_thinking_override(model_cfg);
+    const std::string effort_override = resolved_effort_override(model_cfg);
+
+    if (thinking_override == "enabled") {
         req["thinking"] = {{"type", "enabled"}};
-        if (!model_cfg.effort.empty()) {
+        if (!effort_override.empty()) {
             json output_config = json::object();
             if (req.contains("output_config") && req["output_config"].is_object()) {
                 output_config = req["output_config"];
             }
-            output_config["effort"] = model_cfg.effort;
+            output_config["effort"] = effort_override;
             req["output_config"] = output_config;
         }
-    } else if (model_cfg.thinking == "disabled") {
+    } else if (thinking_override == "disabled") {
         req["thinking"] = {{"type", "disabled"}};
         if (req.contains("output_config") && req["output_config"].is_object()) {
             req["output_config"].erase("effort");
@@ -473,9 +546,10 @@ std::string OpenAIProvider::transformRequest(const json& anthropic_req,
         oai["stream"] = anthropic_req["stream"];
     }
 
-    if (model_cfg.thinking == "enabled") {
+    const std::string thinking_override = resolved_thinking_override(model_cfg);
+    if (thinking_override == "enabled") {
         oai["thinking"] = {{"type", "enabled"}};
-    } else if (model_cfg.thinking == "disabled") {
+    } else if (thinking_override == "disabled") {
         oai["thinking"] = {{"type", "disabled"}};
     }
 
@@ -878,6 +952,7 @@ std::string ProviderRouter::listModels(const Config& cfg) {
 
 std::string ProviderRouter::chat(const Config& cfg,
                                   const std::string& anthropic_body,
+                                  const GatewayRequestContext& request_context,
                                   int& out_status_code)
 {
     out_status_code = 503;
@@ -931,7 +1006,7 @@ std::string ProviderRouter::chat(const Config& cfg,
         req["stream"] = false; // Ensure non-streaming for this path
         std::string backend_body = provider->transformRequest(req, model_cfg);
         std::string url = pcfg->base_url + provider->getEndpoint();
-        auto headers = provider->getHeaders(*pcfg);
+        auto headers = merge_request_headers(provider->getHeaders(*pcfg), request_context);
 
         // Send to backend
         HttpClient client;
@@ -970,8 +1045,92 @@ std::string ProviderRouter::chat(const Config& cfg,
     }
 }
 
+std::string ProviderRouter::countTokens(const Config& cfg,
+                                        const std::string& anthropic_body,
+                                        const GatewayRequestContext& request_context,
+                                        int& out_status_code) {
+    out_status_code = 503;
+    try {
+        auto make_count_tokens_error = [](const std::string& type, const std::string& message) {
+            json err;
+            err["type"] = "error";
+            err["error"] = {{"type", type}, {"message", message}};
+            return err.dump();
+        };
+
+        json req = json::parse(anthropic_body);
+        std::string requested_model = req.value("model", "");
+
+        ModelConfig model_cfg;
+        std::string gateway_model;
+        if (!cfg.resolveModel(requested_model, model_cfg, gateway_model)) {
+            out_status_code = 400;
+            return make_count_tokens_error("invalid_request_error", "Unknown model: " + requested_model);
+        }
+
+        const ProviderConfig* pcfg = cfg.findProvider(model_cfg.provider);
+        if (!pcfg) {
+            out_status_code = 400;
+            return make_count_tokens_error("invalid_request_error", "Provider not found: " + model_cfg.provider);
+        }
+
+        if (pcfg->api_key.empty()) {
+            out_status_code = 401;
+            return make_count_tokens_error("authentication_error", "API key not configured for provider: " + pcfg->name);
+        }
+
+        const std::string provider_type = model_cfg.protocol.empty() ? pcfg->type : model_cfg.protocol;
+        if (provider_type == "anthropic") {
+            auto provider = createProvider(provider_type);
+            if (!provider) {
+                out_status_code = 400;
+                return make_count_tokens_error("invalid_request_error", "Unsupported provider type: " + provider_type);
+            }
+
+            req.erase("stream");
+            const std::string backend_body = provider->transformRequest(req, model_cfg);
+            const std::string url = pcfg->base_url + "/v1/messages/count_tokens";
+            const auto headers = merge_request_headers(provider->getHeaders(*pcfg), request_context);
+
+            HttpClient client;
+            auto resp = client.post(url, headers, backend_body, "application/json", 120000);
+            if (resp.status_code >= 200 && resp.status_code < 300) {
+                try {
+                    json payload = json::parse(resp.body);
+                    if (payload.contains("input_tokens") && payload["input_tokens"].is_number_integer()) {
+                        out_status_code = resp.status_code;
+                        return payload.dump();
+                    }
+                } catch (...) {
+                    // Fall back to local estimation below.
+                }
+            } else if (resp.status_code == 401 || resp.status_code == 403 || resp.status_code == 429) {
+                out_status_code = resp.status_code;
+                return make_count_tokens_error(
+                    resp.status_code == 401 || resp.status_code == 403 ? "authentication_error" : "rate_limit_error",
+                    "Backend count_tokens error (" + std::to_string(resp.status_code) + ")"
+                );
+            }
+        }
+
+        json estimate;
+        estimate["input_tokens"] = estimate_input_tokens(req);
+        out_status_code = 200;
+        return estimate.dump();
+    } catch (json::parse_error& e) {
+        out_status_code = 400;
+        auto err = json{{"type", "error"}, {"error", {{"type", "invalid_request_error"}, {"message", std::string("Invalid JSON: ") + e.what()}}}};
+        return err.dump();
+    } catch (std::exception& e) {
+        out_status_code = 500;
+        auto err = json{{"type", "error"}, {"error", {{"type", "api_error"}, {"message", std::string("Internal error: ") + e.what()}}}};
+        return err.dump();
+    }
+}
+
 void ProviderRouter::chatStream(const Config& cfg,
                                  const std::string& anthropic_body,
+                                 const GatewayRequestContext& request_context,
                                  std::shared_ptr<StreamBuffer> out_buf,
                                  int& out_status_code)
 {
@@ -1049,7 +1208,7 @@ void ProviderRouter::chatStream(const Config& cfg,
         const ProviderConfig provider_cfg = *pcfg;
         const std::string backend_body = provider->transformRequest(req, model_cfg);
         const std::string url = provider_cfg.base_url + provider->getEndpoint();
-        const auto headers = provider->getHeaders(provider_cfg);
+        const auto headers = merge_request_headers(provider->getHeaders(provider_cfg), request_context);
 
         struct StreamStartState {
             std::mutex mtx;

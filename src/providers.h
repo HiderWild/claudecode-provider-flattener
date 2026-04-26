@@ -8,6 +8,11 @@
 
 using json = nlohmann::json;
 
+struct GatewayRequestContext {
+    std::map<std::string, std::string> forwarded_headers;
+    std::string session_id;
+};
+
 // ─── Utility ────────────────────────────────────────────────────────────────
 std::string generate_message_id();
 std::string json_string_or(const json& j, const std::string& key, const std::string& def);
@@ -141,12 +146,20 @@ public:
     // Returns: Anthropic-format response JSON as string
     std::string chat(const Config& cfg,
                      const std::string& anthropic_body,
+                     const GatewayRequestContext& request_context,
                      int& out_status_code);
+
+    // Count input tokens for an Anthropic-format request.
+    std::string countTokens(const Config& cfg,
+                            const std::string& anthropic_body,
+                            const GatewayRequestContext& request_context,
+                            int& out_status_code);
 
     // Stream a chat request via shared StreamBuffer
     // Each chunk in the buffer is Anthropic-format SSE text
     void chatStream(const Config& cfg,
                     const std::string& anthropic_body,
+                    const GatewayRequestContext& request_context,
                     std::shared_ptr<StreamBuffer> out_buf,
                     int& out_status_code);
 

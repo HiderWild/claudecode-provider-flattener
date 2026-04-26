@@ -43,6 +43,71 @@ struct ProviderConfig {
     }
 };
 
+struct ModelCapabilities {
+    bool tools = false;
+    bool streaming = false;
+    bool thinking = false;
+    bool adaptive_thinking = false;
+    bool interleaved_thinking = false;
+    bool count_tokens = false;
+
+    bool anyEnabled() const {
+        return tools || streaming || thinking || adaptive_thinking ||
+               interleaved_thinking || count_tokens;
+    }
+
+    json to_json() const {
+        json j;
+        j["tools"] = tools;
+        j["streaming"] = streaming;
+        j["thinking"] = thinking;
+        j["adaptive_thinking"] = adaptive_thinking;
+        j["interleaved_thinking"] = interleaved_thinking;
+        j["count_tokens"] = count_tokens;
+        return j;
+    }
+
+    static ModelCapabilities from_json(const json& j) {
+        ModelCapabilities c;
+        c.tools = j.value("tools", false);
+        c.streaming = j.value("streaming", false);
+        c.thinking = j.value("thinking", false);
+        c.adaptive_thinking = j.value("adaptive_thinking", false);
+        c.interleaved_thinking = j.value("interleaved_thinking", false);
+        c.count_tokens = j.value("count_tokens", false);
+        return c;
+    }
+};
+
+struct ModelRequestOverrides {
+    std::string thinking_type;
+    std::string effort;
+
+    bool empty() const {
+        return thinking_type.empty() && effort.empty();
+    }
+
+    json to_json() const {
+        json j = json::object();
+        if (!thinking_type.empty()) {
+            j["thinking"] = {{"type", thinking_type}};
+        }
+        if (!effort.empty()) {
+            j["effort"] = effort;
+        }
+        return j;
+    }
+
+    static ModelRequestOverrides from_json(const json& j) {
+        ModelRequestOverrides c;
+        if (j.contains("thinking") && j["thinking"].is_object()) {
+            c.thinking_type = j["thinking"].value("type", "");
+        }
+        c.effort = j.value("effort", "");
+        return c;
+    }
+};
+
 struct ModelConfig {
     std::string id;
     std::string provider;
@@ -51,6 +116,8 @@ struct ModelConfig {
     std::string thinking;
     std::string effort;
     std::string role;
+    ModelCapabilities capabilities;
+    ModelRequestOverrides request_overrides;
 
     json to_json() const {
         json j;
@@ -61,6 +128,8 @@ struct ModelConfig {
         if (!thinking.empty()) j["thinking"] = thinking;
         if (!effort.empty()) j["effort"] = effort;
         if (!role.empty()) j["role"] = role;
+        if (capabilities.anyEnabled()) j["capabilities"] = capabilities.to_json();
+        if (!request_overrides.empty()) j["request_overrides"] = request_overrides.to_json();
         return j;
     }
 
@@ -73,6 +142,18 @@ struct ModelConfig {
         c.thinking = j.value("thinking", "");
         c.effort = j.value("effort", "");
         c.role = j.value("role", "");
+        if (j.contains("capabilities") && j["capabilities"].is_object()) {
+            c.capabilities = ModelCapabilities::from_json(j["capabilities"]);
+        }
+        if (j.contains("request_overrides") && j["request_overrides"].is_object()) {
+            c.request_overrides = ModelRequestOverrides::from_json(j["request_overrides"]);
+        }
+        if (c.request_overrides.thinking_type.empty()) {
+            c.request_overrides.thinking_type = c.thinking;
+        }
+        if (c.request_overrides.effort.empty()) {
+            c.request_overrides.effort = c.effort;
+        }
         return c;
     }
 };
@@ -81,6 +162,7 @@ struct Config {
     int port = 8080;
     std::string bind = "127.0.0.1";
     int thread_pool_size = 8;
+    std::string admin_token;
     std::vector<ProviderConfig> providers;
     std::map<std::string, ModelConfig> models;
     std::map<std::string, std::string> aliases;
@@ -135,6 +217,7 @@ struct Config {
             cfg.port = j.value("port", 8080);
             cfg.bind = j.value("bind", "127.0.0.1");
             cfg.thread_pool_size = j.value("thread_pool_size", 8);
+            cfg.admin_token = j.value("admin_token", "");
             if (cfg.thread_pool_size < 0) {
                 std::cerr << "[config] invalid thread_pool_size: " << cfg.thread_pool_size
                           << " — using default 8" << std::endl;
@@ -194,6 +277,7 @@ struct Config {
         j["port"] = port;
         j["bind"] = bind;
         j["thread_pool_size"] = thread_pool_size;
+        if (!admin_token.empty()) j["admin_token"] = admin_token;
         j["providers"] = json::array();
         for (const auto& p : providers) j["providers"].push_back(p.to_json());
         j["models"] = json::object();

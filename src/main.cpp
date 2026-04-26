@@ -1,5 +1,6 @@
 #include <iostream>
 #include <sstream>
+#include <algorithm>
 #include <atomic>
 #include <fstream>
 #include <iomanip>
@@ -20,11 +21,15 @@
 // ─── Forward declarations ──────────────────────────────────────────────────
 static void handle_list_models(const httplib::Request&, httplib::Response& res);
 static void handle_messages(const httplib::Request& req, httplib::Response& res);
+static void handle_count_tokens(const httplib::Request& req, httplib::Response& res);
 static void handle_webui(const httplib::Request&, httplib::Response& res);
 static void handle_get_config(const httplib::Request&, httplib::Response& res);
 static void handle_get_monitor(const httplib::Request&, httplib::Response& res);
 static void handle_post_config(const httplib::Request& req, httplib::Response& res);
 static void handle_test_provider(const httplib::Request& req, httplib::Response& res);
+static void log_info(const std::string& message, bool show_console);
+static void log_warn(const std::string& message, bool show_console);
+static void log_error(const std::string& message, bool show_console);
 
 static Config g_config;
 static std::mutex g_config_mutex;
@@ -36,6 +41,7 @@ struct MonitorCounters {
     std::atomic<uint64_t> total_requests{0};
     std::atomic<uint64_t> total_stream_requests{0};
     std::atomic<uint64_t> total_nonstream_requests{0};
+    std::atomic<uint64_t> total_count_token_requests{0};
     std::atomic<uint64_t> total_request_errors{0};
     std::atomic<uint64_t> total_stream_completions{0};
     std::atomic<uint64_t> total_stream_cancellations{0};
@@ -47,14 +53,33 @@ struct MonitorCounters {
 struct ActiveStreamMonitor {
     uint64_t id = 0;
     std::string model;
+    std::string session_id;
     std::chrono::system_clock::time_point started_at;
     std::shared_ptr<StreamBuffer> buffer;
+};
+
+struct SessionMonitor {
+    std::string id;
+    std::string last_model;
+    std::chrono::system_clock::time_point first_seen;
+    std::chrono::system_clock::time_point last_seen;
+    uint64_t total_requests = 0;
+    uint64_t total_stream_requests = 0;
+    uint64_t total_nonstream_requests = 0;
+    uint64_t total_count_token_requests = 0;
+    uint64_t total_errors = 0;
+    uint64_t total_stream_completions = 0;
+    uint64_t total_stream_cancellations = 0;
+    uint64_t total_stream_disconnects = 0;
+    size_t active_streams = 0;
 };
 
 static MonitorCounters g_monitor_counters;
 static std::atomic<uint64_t> g_next_stream_id{1};
 static std::mutex g_active_streams_mutex;
 static std::map<uint64_t, ActiveStreamMonitor> g_active_streams;
+static std::mutex g_sessions_mutex;
+static std::map<std::string, SessionMonitor> g_sessions;
 static const auto g_monitor_started_wall = std::chrono::system_clock::now();
 static const auto g_monitor_started_steady = std::chrono::steady_clock::now();
 
@@ -116,6 +141,129 @@ static std::string redact_local_path(const std::string& path) {
     }
 
     return normalized_path;
+}
+
+static GatewayRequestContext extract_request_context(const httplib::Request& req) {
+    GatewayRequestContext context;
+
+    auto add_header = [&](const std::string& header_name, const std::string& forwarded_name = std::string()) {
+        if (!req.has_header(header_name)) {
+            return;
+        }
+        const std::string value = req.get_header_value(header_name);
+        if (value.empty()) {
+            return;
+        }
+        context.forwarded_headers[forwarded_name.empty() ? header_name : forwarded_name] = value;
+    };
+
+    add_header("anthropic-beta");
+    add_header("anthropic-version");
+    add_header("x-claude-code-session-id", "X-Claude-Code-Session-Id");
+
+    auto it = context.forwarded_headers.find("X-Claude-Code-Session-Id");
+    if (it != context.forwarded_headers.end()) {
+        context.session_id = it->second;
+    }
+
+    return context;
+}
+
+static void log_session_event(const std::string& session_id, const std::string& message) {
+    if (session_id.empty()) {
+        return;
+    }
+    log_info("[session " + session_id + "] " + message, false);
+}
+
+static SessionMonitor& ensure_session_monitor_locked(const std::string& session_id,
+                                                     const std::string& model,
+                                                     const std::chrono::system_clock::time_point& now) {
+    SessionMonitor& session = g_sessions[session_id];
+    if (session.id.empty()) {
+        session.id = session_id;
+        session.first_seen = now;
+    }
+    session.last_seen = now;
+    if (!model.empty()) {
+        session.last_model = model;
+    }
+    return session;
+}
+
+static void note_session_request(const std::string& session_id,
+                                 const std::string& model,
+                                 bool stream,
+                                 bool count_tokens = false) {
+    if (session_id.empty()) {
+        return;
+    }
+
+    const auto now = std::chrono::system_clock::now();
+    std::lock_guard<std::mutex> lock(g_sessions_mutex);
+    SessionMonitor& session = ensure_session_monitor_locked(session_id, model, now);
+    if (count_tokens) {
+        ++session.total_count_token_requests;
+        return;
+    }
+
+    ++session.total_requests;
+    if (stream) {
+        ++session.total_stream_requests;
+    } else {
+        ++session.total_nonstream_requests;
+    }
+}
+
+static void note_session_error(const std::string& session_id, const std::string& model) {
+    if (session_id.empty()) {
+        return;
+    }
+
+    const auto now = std::chrono::system_clock::now();
+    std::lock_guard<std::mutex> lock(g_sessions_mutex);
+    SessionMonitor& session = ensure_session_monitor_locked(session_id, model, now);
+    ++session.total_errors;
+}
+
+static void note_session_stream_registered(const std::string& session_id, const std::string& model) {
+    if (session_id.empty()) {
+        return;
+    }
+
+    const auto now = std::chrono::system_clock::now();
+    std::lock_guard<std::mutex> lock(g_sessions_mutex);
+    SessionMonitor& session = ensure_session_monitor_locked(session_id, model, now);
+    ++session.active_streams;
+}
+
+static void note_session_stream_finalized(const std::string& session_id,
+                                          const std::string& model,
+                                          bool error,
+                                          bool cancelled,
+                                          bool client_disconnected) {
+    if (session_id.empty()) {
+        return;
+    }
+
+    const auto now = std::chrono::system_clock::now();
+    std::lock_guard<std::mutex> lock(g_sessions_mutex);
+    SessionMonitor& session = ensure_session_monitor_locked(session_id, model, now);
+    if (session.active_streams > 0) {
+        --session.active_streams;
+    }
+    if (error) {
+        ++session.total_errors;
+        return;
+    }
+    if (cancelled) {
+        ++session.total_stream_cancellations;
+        if (client_disconnected) {
+            ++session.total_stream_disconnects;
+        }
+        return;
+    }
+    ++session.total_stream_completions;
 }
 
 static void append_runtime_log(const std::string& level, const std::string& message) {
@@ -391,6 +539,7 @@ static int run_gateway_server(const StartupOptions& options) {
     });
 
     svr.Get("/v1/models", handle_list_models);
+    svr.Post("/v1/messages/count_tokens", handle_count_tokens);
     svr.Post("/v1/messages", handle_messages);
     svr.Get("/", handle_webui);
     svr.Get("/api/config", handle_get_config);
@@ -418,12 +567,10 @@ static int run_gateway_server(const StartupOptions& options) {
 
     if (show_console) {
         std::cout << std::endl;
-        std::cout << "To use with Claude Code, add to your settings.json:" << std::endl;
-        std::cout << "  {" << std::endl;
-        std::cout << "    \"provider\": \"custom\"," << std::endl;
-        std::cout << "    \"model\": \"<alias>\"," << std::endl;
-        std::cout << "    \"customBaseUrl\": \"http://" << addr << ":" << port << "\"" << std::endl;
-        std::cout << "  }" << std::endl;
+        std::cout << "To use with Claude Code, set these environment variables before launch:" << std::endl;
+        std::cout << "  $env:ANTHROPIC_BASE_URL = \"http://" << addr << ":" << port << "\"" << std::endl;
+        std::cout << "  $env:ANTHROPIC_AUTH_TOKEN = \"local-gateway\"" << std::endl;
+        std::cout << "Then switch gateway aliases inside Claude Code with /model <alias>." << std::endl;
         std::cout << std::endl;
     }
 
@@ -467,7 +614,8 @@ static size_t get_current_process_thread_count() {
 }
 
 static void register_stream_monitor(const std::shared_ptr<StreamBuffer>& buf,
-                                    const std::string& model) {
+                                    const std::string& model,
+                                    const std::string& session_id) {
     const uint64_t stream_id = g_next_stream_id.fetch_add(1, std::memory_order_relaxed);
     {
         std::lock_guard<std::mutex> lock(buf->mtx);
@@ -479,8 +627,11 @@ static void register_stream_monitor(const std::shared_ptr<StreamBuffer>& buf,
     ActiveStreamMonitor monitor;
     monitor.id = stream_id;
     monitor.model = model.empty() ? "<unspecified>" : model;
+    monitor.session_id = session_id;
     monitor.started_at = std::chrono::system_clock::now();
     monitor.buffer = buf;
+
+    note_session_stream_registered(session_id, monitor.model);
 
     std::lock_guard<std::mutex> lock(g_active_streams_mutex);
     g_active_streams[stream_id] = std::move(monitor);
@@ -491,6 +642,8 @@ static void finalize_stream_monitor(const std::shared_ptr<StreamBuffer>& buf) {
     bool cancelled = false;
     bool error = false;
     bool client_disconnected = false;
+    std::string session_id;
+    std::string model = "<unspecified>";
 
     {
         std::lock_guard<std::mutex> lock(buf->mtx);
@@ -507,11 +660,19 @@ static void finalize_stream_monitor(const std::shared_ptr<StreamBuffer>& buf) {
 
     {
         std::lock_guard<std::mutex> lock(g_active_streams_mutex);
-        g_active_streams.erase(stream_id);
+        auto it = g_active_streams.find(stream_id);
+        if (it != g_active_streams.end()) {
+            session_id = it->second.session_id;
+            model = it->second.model;
+            g_active_streams.erase(it);
+        }
     }
+
+    note_session_stream_finalized(session_id, model, error, cancelled, client_disconnected);
 
     if (error) {
         g_monitor_counters.total_request_errors.fetch_add(1, std::memory_order_relaxed);
+        log_session_event(session_id, "stream error model=" + model);
         return;
     }
 
@@ -520,10 +681,13 @@ static void finalize_stream_monitor(const std::shared_ptr<StreamBuffer>& buf) {
         if (client_disconnected) {
             g_monitor_counters.total_stream_disconnects.fetch_add(1, std::memory_order_relaxed);
         }
+        log_session_event(session_id, std::string("stream cancelled model=") + model +
+            (client_disconnected ? " reason=client_disconnect" : ""));
         return;
     }
 
     g_monitor_counters.total_stream_completions.fetch_add(1, std::memory_order_relaxed);
+    log_session_event(session_id, "stream completed model=" + model);
 }
 
 // ─── Request body helpers ──────────────────────────────────────────────────
@@ -592,13 +756,74 @@ static Config get_config_snapshot() {
     return g_config;
 }
 
+static std::string mask_secret_value(const std::string& secret) {
+    if (secret.empty()) {
+        return "";
+    }
+    if (secret.size() <= 4) {
+        return std::string(secret.size(), '*');
+    }
+    return std::string(secret.size() - 4, '*') + secret.substr(secret.size() - 4);
+}
+
+static bool is_masked_secret_reference(const std::string& candidate, const std::string& existing_secret) {
+    return !candidate.empty() && !existing_secret.empty() && candidate == mask_secret_value(existing_secret);
+}
+
+static std::string resolve_secret_update(const std::string& candidate, const std::string& existing_secret) {
+    if (is_masked_secret_reference(candidate, existing_secret)) {
+        return existing_secret;
+    }
+    return candidate;
+}
+
+static std::string extract_control_plane_token(const httplib::Request& req) {
+    if (req.has_header("X-Gateway-Admin-Token")) {
+        return req.get_header_value("X-Gateway-Admin-Token");
+    }
+    if (req.has_header("X-Admin-Token")) {
+        return req.get_header_value("X-Admin-Token");
+    }
+    if (req.has_header("Authorization")) {
+        const std::string auth = req.get_header_value("Authorization");
+        const std::string bearer = "Bearer ";
+        if (auth.rfind(bearer, 0) == 0) {
+            return auth.substr(bearer.size());
+        }
+    }
+    if (req.has_param("token")) {
+        return req.get_param_value("token");
+    }
+    return "";
+}
+
+static bool ensure_control_plane_access(const httplib::Request& req, httplib::Response& res) {
+    const Config cfg = get_config_snapshot();
+    if (cfg.admin_token.empty()) {
+        return true;
+    }
+
+    if (extract_control_plane_token(req) == cfg.admin_token) {
+        return true;
+    }
+
+    res.status = 401;
+    res.set_content(make_error("authentication_error", "control plane token required"), "application/json");
+    return false;
+}
+
 static json config_to_json(const Config& cfg) {
     json j;
     j["port"] = cfg.port;
     j["bind"] = cfg.bind;
     j["thread_pool_size"] = cfg.thread_pool_size;
+    j["admin_token"] = mask_secret_value(cfg.admin_token);
     j["providers"] = json::array();
-    for (const auto& p : cfg.providers) j["providers"].push_back(p.to_json());
+    for (const auto& p : cfg.providers) {
+        json provider_json = p.to_json();
+        provider_json["api_key"] = mask_secret_value(p.api_key);
+        j["providers"].push_back(std::move(provider_json));
+    }
     j["models"] = json::object();
     for (const auto& [id, model] : cfg.models) j["models"][id] = model.to_json();
     j["aliases"] = json::object();
@@ -710,6 +935,7 @@ static void handle_list_models(const httplib::Request&, httplib::Response& res) 
 
 // POST /v1/messages — Anthropic Messages API compatible endpoint
 static void handle_messages(const httplib::Request& req, httplib::Response& res) {
+    GatewayRequestContext request_context = extract_request_context(req);
     bool parse_ok;
     json body = parse_json_body(req, parse_ok);
     if (!parse_ok) {
@@ -724,6 +950,9 @@ static void handle_messages(const httplib::Request& req, httplib::Response& res)
     bool stream = body.value("stream", false);
     const std::string requested_model = body.value("model", std::string());
     g_monitor_counters.total_requests.fetch_add(1, std::memory_order_relaxed);
+    note_session_request(request_context.session_id, requested_model, stream);
+    log_session_event(request_context.session_id,
+        std::string("messages model=") + requested_model + (stream ? " stream=true" : " stream=false"));
     if (stream) {
         g_monitor_counters.total_stream_requests.fetch_add(1, std::memory_order_relaxed);
     } else {
@@ -738,7 +967,7 @@ static void handle_messages(const httplib::Request& req, httplib::Response& res)
         int status_code = 503;
 
         // Start backend request in background
-        ProviderRouter::instance().chatStream(cfg, req.body, buf, status_code);
+        ProviderRouter::instance().chatStream(cfg, req.body, request_context, buf, status_code);
 
         if (status_code >= 400) {
             std::string error_payload;
@@ -747,13 +976,16 @@ static void handle_messages(const httplib::Request& req, httplib::Response& res)
                 error_payload = buf->error_msg;
             }
             g_monitor_counters.total_request_errors.fetch_add(1, std::memory_order_relaxed);
+            note_session_error(request_context.session_id, requested_model);
+            log_session_event(request_context.session_id,
+                "messages stream_start_failed model=" + requested_model + " status=" + std::to_string(status_code));
             res.status = status_code;
             res.set_content(normalize_error_payload(status_code, error_payload),
                             "application/json");
             return;
         }
 
-        register_stream_monitor(buf, requested_model);
+        register_stream_monitor(buf, requested_model, request_context.session_id);
 
         // SSE response
         res.status = 200;
@@ -778,13 +1010,48 @@ static void handle_messages(const httplib::Request& req, httplib::Response& res)
         // ─── Non-streaming response ──────────────────────────────────────
         int status_code = 503;
         std::string result = ProviderRouter::instance().chat(
-            cfg, req.body, status_code);
+            cfg, req.body, request_context, status_code);
         if (status_code >= 400) {
             g_monitor_counters.total_request_errors.fetch_add(1, std::memory_order_relaxed);
+            note_session_error(request_context.session_id, requested_model);
         }
+        log_session_event(request_context.session_id,
+            "messages completed model=" + requested_model + " status=" + std::to_string(status_code));
         res.status = status_code;
         res.set_content(result, "application/json");
     }
+}
+
+// POST /v1/messages/count_tokens — Anthropic Messages count_tokens compatible endpoint
+static void handle_count_tokens(const httplib::Request& req, httplib::Response& res) {
+    GatewayRequestContext request_context = extract_request_context(req);
+    bool parse_ok;
+    json body = parse_json_body(req, parse_ok);
+    if (!parse_ok) {
+        g_monitor_counters.total_count_token_requests.fetch_add(1, std::memory_order_relaxed);
+        g_monitor_counters.total_request_errors.fetch_add(1, std::memory_order_relaxed);
+        res.status = 400;
+        res.set_content(make_error("invalid_request_error", "Invalid JSON body"), "application/json");
+        return;
+    }
+
+    const std::string requested_model = body.value("model", std::string());
+    g_monitor_counters.total_count_token_requests.fetch_add(1, std::memory_order_relaxed);
+    note_session_request(request_context.session_id, requested_model, false, true);
+    log_session_event(request_context.session_id, "count_tokens model=" + requested_model);
+
+    const Config cfg = get_config_snapshot();
+    int status_code = 503;
+    std::string result = ProviderRouter::instance().countTokens(cfg, req.body, request_context, status_code);
+    if (status_code >= 400) {
+        g_monitor_counters.total_request_errors.fetch_add(1, std::memory_order_relaxed);
+        note_session_error(request_context.session_id, requested_model);
+    }
+    log_session_event(request_context.session_id,
+        "count_tokens completed model=" + requested_model + " status=" + std::to_string(status_code));
+
+    res.status = status_code;
+    res.set_content(result, "application/json");
 }
 
 // GET / — web UI
@@ -793,17 +1060,24 @@ static void handle_webui(const httplib::Request&, httplib::Response& res) {
 }
 
 // GET /api/config — get current configuration
-static void handle_get_config(const httplib::Request&, httplib::Response& res) {
+static void handle_get_config(const httplib::Request& req, httplib::Response& res) {
+    if (!ensure_control_plane_access(req, res)) {
+        return;
+    }
     res.set_content(config_to_json(get_config_snapshot()).dump(2), "application/json");
 }
 
 // GET /api/monitor — lightweight runtime metrics and active stream view
-static void handle_get_monitor(const httplib::Request&, httplib::Response& res) {
+static void handle_get_monitor(const httplib::Request& req, httplib::Response& res) {
+    if (!ensure_control_plane_access(req, res)) {
+        return;
+    }
     const Config cfg = get_config_snapshot();
     const auto now_wall = std::chrono::system_clock::now();
     const auto now_steady = std::chrono::steady_clock::now();
 
     json streams = json::array();
+    json sessions = json::array();
     size_t total_buffered_bytes = 0;
 
     {
@@ -812,6 +1086,7 @@ static void handle_get_monitor(const httplib::Request&, httplib::Response& res) 
             json stream_json;
             stream_json["id"] = stream_id;
             stream_json["model"] = monitor.model;
+            stream_json["session_id"] = monitor.session_id;
             stream_json["started_at_unix_ms"] = unix_ms_since_epoch(monitor.started_at);
             stream_json["age_seconds"] = std::chrono::duration_cast<std::chrono::seconds>(
                 now_wall - monitor.started_at).count();
@@ -844,6 +1119,34 @@ static void handle_get_monitor(const httplib::Request&, httplib::Response& res) 
         }
     }
 
+    {
+        std::vector<SessionMonitor> session_rows;
+        std::lock_guard<std::mutex> lock(g_sessions_mutex);
+        for (const auto& [_, session] : g_sessions) {
+            session_rows.push_back(session);
+        }
+        std::sort(session_rows.begin(), session_rows.end(), [](const SessionMonitor& lhs, const SessionMonitor& rhs) {
+            return lhs.last_seen > rhs.last_seen;
+        });
+        for (const auto& session : session_rows) {
+            sessions.push_back({
+                {"id", session.id},
+                {"last_model", session.last_model},
+                {"first_seen_unix_ms", unix_ms_since_epoch(session.first_seen)},
+                {"last_seen_unix_ms", unix_ms_since_epoch(session.last_seen)},
+                {"active_streams", session.active_streams},
+                {"total_requests", session.total_requests},
+                {"total_stream_requests", session.total_stream_requests},
+                {"total_nonstream_requests", session.total_nonstream_requests},
+                {"total_count_token_requests", session.total_count_token_requests},
+                {"total_errors", session.total_errors},
+                {"total_stream_completions", session.total_stream_completions},
+                {"total_stream_cancellations", session.total_stream_cancellations},
+                {"total_stream_disconnects", session.total_stream_disconnects}
+            });
+        }
+    }
+
     json monitor;
     monitor["started_at_unix_ms"] = unix_ms_since_epoch(g_monitor_started_wall);
     monitor["uptime_seconds"] = std::chrono::duration_cast<std::chrono::seconds>(
@@ -869,6 +1172,7 @@ static void handle_get_monitor(const httplib::Request&, httplib::Response& res) 
         {"total_requests", g_monitor_counters.total_requests.load(std::memory_order_relaxed)},
         {"total_stream_requests", g_monitor_counters.total_stream_requests.load(std::memory_order_relaxed)},
         {"total_nonstream_requests", g_monitor_counters.total_nonstream_requests.load(std::memory_order_relaxed)},
+        {"total_count_token_requests", g_monitor_counters.total_count_token_requests.load(std::memory_order_relaxed)},
         {"total_request_errors", g_monitor_counters.total_request_errors.load(std::memory_order_relaxed)},
         {"total_stream_completions", g_monitor_counters.total_stream_completions.load(std::memory_order_relaxed)},
         {"total_stream_cancellations", g_monitor_counters.total_stream_cancellations.load(std::memory_order_relaxed)},
@@ -876,6 +1180,7 @@ static void handle_get_monitor(const httplib::Request&, httplib::Response& res) 
         {"total_config_saves", g_monitor_counters.total_config_saves.load(std::memory_order_relaxed)},
         {"total_provider_tests", g_monitor_counters.total_provider_tests.load(std::memory_order_relaxed)}
     };
+    monitor["sessions"] = std::move(sessions);
     monitor["streams"] = std::move(streams);
 
     res.set_content(monitor.dump(2), "application/json");
@@ -883,6 +1188,10 @@ static void handle_get_monitor(const httplib::Request&, httplib::Response& res) 
 
 // POST /api/config — update configuration
 static void handle_post_config(const httplib::Request& req, httplib::Response& res) {
+    if (!ensure_control_plane_access(req, res)) {
+        return;
+    }
+
     bool ok;
     json j = parse_json_body(req, ok);
     if (!ok) {
@@ -918,10 +1227,23 @@ static void handle_post_config(const httplib::Request& req, httplib::Response& r
                 }
                 updated.thread_pool_size = thread_pool_size;
             }
+            if (j.contains("admin_token") && j["admin_token"].is_string()) {
+                updated.admin_token = resolve_secret_update(j["admin_token"].get<std::string>(), g_config.admin_token);
+            }
             if (j.contains("providers") && j["providers"].is_array()) {
                 updated.providers.clear();
-                for (const auto& p : j["providers"])
-                    updated.providers.push_back(ProviderConfig::from_json(p));
+                for (const auto& p : j["providers"]) {
+                    ProviderConfig provider = ProviderConfig::from_json(p);
+                    const ProviderConfig* existing_provider = g_config.findProvider(provider.id);
+                    if (p.contains("api_key") && p["api_key"].is_string()) {
+                        provider.api_key = resolve_secret_update(
+                            p["api_key"].get<std::string>(),
+                            existing_provider ? existing_provider->api_key : std::string());
+                    } else if (existing_provider) {
+                        provider.api_key = existing_provider->api_key;
+                    }
+                    updated.providers.push_back(std::move(provider));
+                }
             }
             if (j.contains("models") && j["models"].is_object()) {
                 updated.models.clear();
@@ -974,6 +1296,10 @@ static void handle_post_config(const httplib::Request& req, httplib::Response& r
 
 // GET /api/config/test — test a provider connection
 static void handle_test_provider(const httplib::Request& req, httplib::Response& res) {
+    if (!ensure_control_plane_access(req, res)) {
+        return;
+    }
+
     g_monitor_counters.total_provider_tests.fetch_add(1, std::memory_order_relaxed);
     auto provider_id = req.get_param_value("provider_id");
     if (provider_id.empty()) {
