@@ -1,0 +1,31 @@
+# Build outputs
+/build/
+/cmake-build-*/
+CMakeCache.txt
+cmake_install.cmake
+compile_commands.json
+*.obj
+*.obj.d
+*.a
+*.dll
+*.exe
+*.exp
+*.ilk
+*.lib
+*.manifest
+*.pdb
+*.rsp
+
+# Runtime and local state
+*.log
+*.tmp
+*.bak-*
+.omc/
+**/.omc/
+
+# Editor and OS noise
+.vscode/
+.vs/
+.idea/
+.DS_Store
+Thumbs.db

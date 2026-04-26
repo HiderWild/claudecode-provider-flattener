@@ -1,0 +1,1058 @@
+#include <iostream>
+#include <sstream>
+#include <atomic>
+#include <fstream>
+#include <iomanip>
+#include <map>
+#include <vector>
+#include <thread>
+#include <chrono>
+// httplib must be included before windows.h on Windows (it handles winsock2.h order)
+#include <httplib.h>
+#include <windows.h>
+#include <tlhelp32.h>
+#include "config.h"
+#include "providers.h"
+#include "http_client.h"
+#include "server_thread_pool.h"
+#include "webui.h"
+
+// ─── Forward declarations ──────────────────────────────────────────────────
+static void handle_list_models(const httplib::Request&, httplib::Response& res);
+static void handle_messages(const httplib::Request& req, httplib::Response& res);
+static void handle_webui(const httplib::Request&, httplib::Response& res);
+static void handle_get_config(const httplib::Request&, httplib::Response& res);
+static void handle_get_monitor(const httplib::Request&, httplib::Response& res);
+static void handle_post_config(const httplib::Request& req, httplib::Response& res);
+static void handle_test_provider(const httplib::Request& req, httplib::Response& res);
+
+static Config g_config;
+static std::mutex g_config_mutex;
+static int g_effective_thread_pool_size = ServerThreadPool::kDefaultThreadCount;
+static std::mutex g_runtime_log_mutex;
+static bool g_console_visible = false;
+
+struct MonitorCounters {
+    std::atomic<uint64_t> total_requests{0};
+    std::atomic<uint64_t> total_stream_requests{0};
+    std::atomic<uint64_t> total_nonstream_requests{0};
+    std::atomic<uint64_t> total_request_errors{0};
+    std::atomic<uint64_t> total_stream_completions{0};
+    std::atomic<uint64_t> total_stream_cancellations{0};
+    std::atomic<uint64_t> total_stream_disconnects{0};
+    std::atomic<uint64_t> total_config_saves{0};
+    std::atomic<uint64_t> total_provider_tests{0};
+};
+
+struct ActiveStreamMonitor {
+    uint64_t id = 0;
+    std::string model;
+    std::chrono::system_clock::time_point started_at;
+    std::shared_ptr<StreamBuffer> buffer;
+};
+
+static MonitorCounters g_monitor_counters;
+static std::atomic<uint64_t> g_next_stream_id{1};
+static std::mutex g_active_streams_mutex;
+static std::map<uint64_t, ActiveStreamMonitor> g_active_streams;
+static const auto g_monitor_started_wall = std::chrono::system_clock::now();
+static const auto g_monitor_started_steady = std::chrono::steady_clock::now();
+
+struct StartupOptions {
+    bool show_console = false;
+    bool daemon = false;
+    bool internal_run = false;
+    bool internal_daemon = false;
+    bool show_help = false;
+    bool has_port_override = false;
+    int port_override = 0;
+};
+
+static std::wstring get_executable_path_w() {
+    std::wstring path(MAX_PATH, L'\0');
+    DWORD len = GetModuleFileNameW(nullptr, path.data(), static_cast<DWORD>(path.size()));
+    if (len == 0) {
+        return L"";
+    }
+    path.resize(len);
+    return path;
+}
+
+static std::wstring get_runtime_directory_w() {
+    std::wstring path = get_executable_path_w();
+    size_t slash = path.find_last_of(L"\\/");
+    if (slash == std::wstring::npos) {
+        return L".";
+    }
+    return path.substr(0, slash);
+}
+
+static std::string get_runtime_log_path() {
+    return HttpClient::wide_to_utf8(get_runtime_directory_w()) + "/model-gateway.log";
+}
+
+static std::string get_home_directory() {
+    const char* home = getenv("USERPROFILE");
+    if (!home) home = getenv("HOME");
+    return home ? home : "";
+}
+
+static std::string normalize_path_separators(std::string path) {
+    for (char& ch : path) {
+        if (ch == '\\') ch = '/';
+    }
+    return path;
+}
+
+static std::string redact_local_path(const std::string& path) {
+    if (path.empty()) {
+        return path;
+    }
+
+    const std::string normalized_path = normalize_path_separators(path);
+    const std::string home_dir = normalize_path_separators(get_home_directory());
+    if (!home_dir.empty() && normalized_path.rfind(home_dir, 0) == 0) {
+        return "~" + normalized_path.substr(home_dir.size());
+    }
+
+    return normalized_path;
+}
+
+static void append_runtime_log(const std::string& level, const std::string& message) {
+    std::lock_guard<std::mutex> lock(g_runtime_log_mutex);
+    std::ofstream log_file(get_runtime_log_path(), std::ios::app);
+    if (!log_file.good()) {
+        return;
+    }
+
+    SYSTEMTIME now;
+    GetLocalTime(&now);
+    log_file << std::setfill('0')
+             << std::setw(4) << now.wYear << '-'
+             << std::setw(2) << now.wMonth << '-'
+             << std::setw(2) << now.wDay << ' '
+             << std::setw(2) << now.wHour << ':'
+             << std::setw(2) << now.wMinute << ':'
+             << std::setw(2) << now.wSecond << '.'
+             << std::setw(3) << now.wMilliseconds
+             << " [" << level << "]"
+             << " [pid " << GetCurrentProcessId() << "] "
+             << message << std::endl;
+}
+
+static void log_info(const std::string& message, bool show_console) {
+    append_runtime_log("INFO", message);
+    if (show_console) {
+        std::cout << message << std::endl;
+    }
+}
+
+static void log_warn(const std::string& message, bool show_console) {
+    append_runtime_log("WARN", message);
+    if (show_console) {
+        std::cerr << message << std::endl;
+    }
+}
+
+static void log_error(const std::string& message, bool show_console) {
+    append_runtime_log("ERROR", message);
+    if (show_console) {
+        std::cerr << message << std::endl;
+    }
+}
+
+static void print_usage() {
+    std::cout << "Usage: model-gateway.exe [--show] [--daemon] [port]" << std::endl;
+    std::cout << "  --show    Run in the current console instead of detaching to background." << std::endl;
+    std::cout << "  --daemon  Launch a supervisor that restarts the worker if it exits." << std::endl;
+    std::cout << "  port      Optional port override for this launch." << std::endl;
+}
+
+static bool try_parse_port(const std::string& value, int& port) {
+    try {
+        size_t consumed = 0;
+        port = std::stoi(value, &consumed);
+        return consumed == value.size();
+    } catch (...) {
+        return false;
+    }
+}
+
+static bool parse_startup_options(int argc, char* argv[], StartupOptions& options,
+                                  std::string& error_message) {
+    for (int i = 1; i < argc; ++i) {
+        const std::string arg = argv[i];
+        if (arg == "--show") {
+            options.show_console = true;
+            continue;
+        }
+        if (arg == "--daemon") {
+            options.daemon = true;
+            continue;
+        }
+        if (arg == "--internal-run") {
+            options.internal_run = true;
+            continue;
+        }
+        if (arg == "--internal-daemon") {
+            options.internal_daemon = true;
+            options.daemon = true;
+            continue;
+        }
+        if (arg == "--help" || arg == "-h") {
+            options.show_help = true;
+            continue;
+        }
+        if (!arg.empty() && arg[0] == '-') {
+            error_message = "Unknown option: " + arg;
+            return false;
+        }
+        if (options.has_port_override) {
+            error_message = "Only one port override may be specified.";
+            return false;
+        }
+        if (!try_parse_port(arg, options.port_override)) {
+            error_message = "Invalid port override: " + arg;
+            return false;
+        }
+        options.has_port_override = true;
+    }
+
+    if (options.internal_run && options.internal_daemon) {
+        error_message = "Internal run modes cannot be combined.";
+        return false;
+    }
+
+    return true;
+}
+
+static bool spawn_gateway_process(const std::wstring& mode_flag,
+                                  const StartupOptions& options,
+                                  bool detached,
+                                  PROCESS_INFORMATION& process_info,
+                                  std::string& error_message) {
+    STARTUPINFOW startup_info;
+    ZeroMemory(&startup_info, sizeof(startup_info));
+    startup_info.cb = sizeof(startup_info);
+
+    ZeroMemory(&process_info, sizeof(process_info));
+
+    const std::wstring exe_path = get_executable_path_w();
+    if (exe_path.empty()) {
+        error_message = "GetModuleFileNameW failed.";
+        return false;
+    }
+
+    std::wstring command_line = L"\"" + exe_path + L"\" " + mode_flag;
+    if (options.has_port_override) {
+        command_line += L" " + std::to_wstring(options.port_override);
+    }
+
+    std::vector<wchar_t> command_buffer(command_line.begin(), command_line.end());
+    command_buffer.push_back(L'\0');
+
+    DWORD creation_flags = CREATE_UNICODE_ENVIRONMENT;
+    if (detached) {
+        creation_flags |= DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP;
+    }
+
+    const std::wstring working_directory = get_runtime_directory_w();
+    if (!CreateProcessW(exe_path.c_str(),
+                        command_buffer.data(),
+                        nullptr,
+                        nullptr,
+                        FALSE,
+                        creation_flags,
+                        nullptr,
+                        working_directory.c_str(),
+                        &startup_info,
+                        &process_info)) {
+        error_message = "CreateProcessW failed with code " + std::to_string(GetLastError());
+        return false;
+    }
+
+    return true;
+}
+
+static int launch_detached_mode(const StartupOptions& options) {
+    PROCESS_INFORMATION process_info;
+    std::string error_message;
+    const bool daemon_mode = options.daemon && !options.internal_run;
+
+    if (!spawn_gateway_process(daemon_mode ? L"--internal-daemon" : L"--internal-run",
+                               options,
+                               true,
+                               process_info,
+                               error_message)) {
+        log_error("[launcher] failed to start detached process: " + error_message, true);
+        return 1;
+    }
+
+    const std::string mode_name = daemon_mode ? "daemon" : "worker";
+    append_runtime_log("INFO", "[launcher] started background " + mode_name +
+        " pid=" + std::to_string(process_info.dwProcessId));
+    std::cout << "[launcher] started background " << mode_name
+              << " pid=" << process_info.dwProcessId << std::endl;
+
+    CloseHandle(process_info.hThread);
+    CloseHandle(process_info.hProcess);
+    return 0;
+}
+
+static int run_daemon_supervisor(const StartupOptions& options) {
+    const bool show_console = options.show_console;
+    log_info("[daemon] supervisor started", show_console);
+
+    while (true) {
+        PROCESS_INFORMATION worker_process;
+        std::string error_message;
+        if (!spawn_gateway_process(L"--internal-run",
+                                   options,
+                                   true,
+                                   worker_process,
+                                   error_message)) {
+            log_error("[daemon] failed to launch worker: " + error_message, show_console);
+            std::this_thread::sleep_for(std::chrono::seconds(2));
+            continue;
+        }
+
+        log_info("[daemon] worker started pid=" +
+                 std::to_string(worker_process.dwProcessId), show_console);
+
+        const auto started_at = std::chrono::steady_clock::now();
+        const DWORD wait_result = WaitForSingleObject(worker_process.hProcess, INFINITE);
+        DWORD exit_code = 1;
+        GetExitCodeProcess(worker_process.hProcess, &exit_code);
+
+        CloseHandle(worker_process.hThread);
+        CloseHandle(worker_process.hProcess);
+
+        if (wait_result != WAIT_OBJECT_0) {
+            log_warn("[daemon] wait on worker returned " + std::to_string(wait_result), show_console);
+        }
+
+        const auto runtime = std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::steady_clock::now() - started_at).count();
+        const bool failed_fast = runtime < 5;
+        const auto restart_delay = failed_fast ? std::chrono::seconds(2)
+                                               : std::chrono::milliseconds(800);
+
+        log_warn("[daemon] worker exited code=" + std::to_string(exit_code) +
+                 ", uptime=" + std::to_string(runtime) +
+                 "s, restart in " +
+                 std::to_string(std::chrono::duration_cast<std::chrono::milliseconds>(restart_delay).count()) +
+                 "ms", show_console);
+        std::this_thread::sleep_for(restart_delay);
+    }
+}
+
+static int run_gateway_server(const StartupOptions& options) {
+    const bool show_console = options.show_console;
+    g_console_visible = show_console;
+
+    if (show_console) {
+        SetConsoleOutputCP(CP_UTF8);
+        SetConsoleCP(CP_UTF8);
+
+        std::cout << "+------------------------------------------+" << std::endl;
+        std::cout << "|     Model Gateway v1.0.0                 |" << std::endl;
+        std::cout << "|     Multi-provider proxy for Claude Code |" << std::endl;
+        std::cout << "+------------------------------------------+" << std::endl;
+        std::cout << std::endl;
+    }
+
+    g_config = Config::load();
+    if (options.has_port_override) {
+        g_config.port = options.port_override;
+    }
+
+    log_info("[gateway] config: " + redact_local_path(Config::getConfigPath()), show_console);
+    log_info("[gateway] " + std::to_string(g_config.providers.size()) + " provider(s), " +
+             std::to_string(g_config.aliases.size()) + " alias(es), " +
+             std::to_string(g_config.models.size()) + " model(s)", show_console);
+
+    httplib::Server svr;
+    const int thread_pool_size = g_config.thread_pool_size;
+    g_effective_thread_pool_size = thread_pool_size;
+    svr.new_task_queue = [thread_pool_size]() {
+        return new ServerThreadPool(static_cast<size_t>(thread_pool_size));
+    };
+
+    svr.set_pre_routing_handler([](const httplib::Request& req, httplib::Response& res) {
+        if (req.method == "OPTIONS") {
+            res.set_header("Access-Control-Allow-Origin", "*");
+            res.set_header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
+            res.set_header("Access-Control-Allow-Headers", "Content-Type, Authorization");
+            res.status = 204;
+            return httplib::Server::HandlerResponse::Handled;
+        }
+        res.set_header("Access-Control-Allow-Origin", "*");
+        return httplib::Server::HandlerResponse::Unhandled;
+    });
+
+    svr.Get("/v1/models", handle_list_models);
+    svr.Post("/v1/messages", handle_messages);
+    svr.Get("/", handle_webui);
+    svr.Get("/api/config", handle_get_config);
+    svr.Get("/api/monitor", handle_get_monitor);
+    svr.Post("/api/config", handle_post_config);
+    svr.Get("/api/config/test", handle_test_provider);
+
+    std::string addr = g_config.bind;
+    int port = g_config.port;
+
+    log_info("[gateway] server starting on http://" + addr + ":" + std::to_string(port),
+             show_console);
+    if (thread_pool_size == 0) {
+        log_info("[gateway] thread pool: unbounded dynamic workers (base " +
+                 std::to_string(ServerThreadPool::kDefaultThreadCount) + ")",
+                 show_console);
+    } else {
+        log_info("[gateway] thread pool: fixed " + std::to_string(thread_pool_size) +
+                 " worker(s)", show_console);
+    }
+    log_info("[gateway] web UI:  http://" + addr + ":" + std::to_string(port) + "/",
+             show_console);
+    log_info("[gateway] models:  http://" + addr + ":" + std::to_string(port) + "/v1/models",
+             show_console);
+
+    if (show_console) {
+        std::cout << std::endl;
+        std::cout << "To use with Claude Code, add to your settings.json:" << std::endl;
+        std::cout << "  {" << std::endl;
+        std::cout << "    \"provider\": \"custom\"," << std::endl;
+        std::cout << "    \"model\": \"<alias>\"," << std::endl;
+        std::cout << "    \"customBaseUrl\": \"http://" << addr << ":" << port << "\"" << std::endl;
+        std::cout << "  }" << std::endl;
+        std::cout << std::endl;
+    }
+
+    if (!svr.listen(addr, port)) {
+        log_error("[gateway] failed to start on " + addr + ":" + std::to_string(port),
+                  show_console);
+        return 1;
+    }
+
+    log_warn("[gateway] server stopped", show_console);
+    return 0;
+}
+
+static long long unix_ms_since_epoch(const std::chrono::system_clock::time_point& time_point) {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+        time_point.time_since_epoch()).count();
+}
+
+static size_t get_current_process_thread_count() {
+    HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    if (snapshot == INVALID_HANDLE_VALUE) {
+        return 0;
+    }
+
+    THREADENTRY32 entry;
+    entry.dwSize = sizeof(entry);
+    const DWORD current_pid = GetCurrentProcessId();
+    size_t count = 0;
+
+    if (Thread32First(snapshot, &entry)) {
+        do {
+            if (entry.th32OwnerProcessID == current_pid) {
+                ++count;
+            }
+            entry.dwSize = sizeof(entry);
+        } while (Thread32Next(snapshot, &entry));
+    }
+
+    CloseHandle(snapshot);
+    return count;
+}
+
+static void register_stream_monitor(const std::shared_ptr<StreamBuffer>& buf,
+                                    const std::string& model) {
+    const uint64_t stream_id = g_next_stream_id.fetch_add(1, std::memory_order_relaxed);
+    {
+        std::lock_guard<std::mutex> lock(buf->mtx);
+        buf->monitor_stream_id = stream_id;
+        buf->monitor_finalized = false;
+        buf->client_disconnected = false;
+    }
+
+    ActiveStreamMonitor monitor;
+    monitor.id = stream_id;
+    monitor.model = model.empty() ? "<unspecified>" : model;
+    monitor.started_at = std::chrono::system_clock::now();
+    monitor.buffer = buf;
+
+    std::lock_guard<std::mutex> lock(g_active_streams_mutex);
+    g_active_streams[stream_id] = std::move(monitor);
+}
+
+static void finalize_stream_monitor(const std::shared_ptr<StreamBuffer>& buf) {
+    uint64_t stream_id = 0;
+    bool cancelled = false;
+    bool error = false;
+    bool client_disconnected = false;
+
+    {
+        std::lock_guard<std::mutex> lock(buf->mtx);
+        if (buf->monitor_stream_id == 0 || buf->monitor_finalized) {
+            return;
+        }
+
+        buf->monitor_finalized = true;
+        stream_id = buf->monitor_stream_id;
+        cancelled = buf->cancelled;
+        error = buf->error;
+        client_disconnected = buf->client_disconnected;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(g_active_streams_mutex);
+        g_active_streams.erase(stream_id);
+    }
+
+    if (error) {
+        g_monitor_counters.total_request_errors.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+
+    if (cancelled) {
+        g_monitor_counters.total_stream_cancellations.fetch_add(1, std::memory_order_relaxed);
+        if (client_disconnected) {
+            g_monitor_counters.total_stream_disconnects.fetch_add(1, std::memory_order_relaxed);
+        }
+        return;
+    }
+
+    g_monitor_counters.total_stream_completions.fetch_add(1, std::memory_order_relaxed);
+}
+
+// ─── Request body helpers ──────────────────────────────────────────────────
+static std::string get_body(const httplib::Request& req) {
+    return req.body;
+}
+
+static json parse_json_body(const httplib::Request& req, bool& ok) {
+    ok = false;
+    try {
+        json j = json::parse(req.body);
+        ok = true;
+        return j;
+    } catch (...) {
+        return json::object();
+    }
+}
+
+// ─── Anthropic error response helper ───────────────────────────────────────
+static std::string make_error(const std::string& type, const std::string& message) {
+    json err;
+    err["type"] = "error";
+    err["error"] = {{"type", type}, {"message", message}};
+    return err.dump();
+}
+
+static std::string error_type_for_status(int status_code) {
+    if (status_code == 400) return "invalid_request_error";
+    if (status_code == 401) return "authentication_error";
+    if (status_code == 429) return "rate_limit_error";
+    return "api_error";
+}
+
+static std::string normalize_error_payload(int status_code, const std::string& raw_payload) {
+    const std::string fallback_type = error_type_for_status(status_code);
+    const std::string fallback_message = raw_payload.empty()
+        ? ("Backend error (" + std::to_string(status_code) + ")")
+        : raw_payload;
+
+    try {
+        json payload = json::parse(raw_payload);
+        if (payload.value("type", "") == "error" &&
+            payload.contains("error") && payload["error"].is_object()) {
+            if (!payload["error"].contains("type") || !payload["error"]["type"].is_string()) {
+                payload["error"]["type"] = fallback_type;
+            }
+            return payload.dump();
+        }
+
+        if (payload.contains("error") && payload["error"].is_object()) {
+            std::string message = payload["error"].value(
+                "message",
+                "Backend error (" + std::to_string(status_code) + ")"
+            );
+            return make_error(fallback_type, message);
+        }
+    } catch (...) {
+        // Fall back to a wrapped Anthropic-style error below.
+    }
+
+    return make_error(fallback_type, fallback_message);
+}
+
+static Config get_config_snapshot() {
+    std::lock_guard<std::mutex> lock(g_config_mutex);
+    return g_config;
+}
+
+static json config_to_json(const Config& cfg) {
+    json j;
+    j["port"] = cfg.port;
+    j["bind"] = cfg.bind;
+    j["thread_pool_size"] = cfg.thread_pool_size;
+    j["providers"] = json::array();
+    for (const auto& p : cfg.providers) j["providers"].push_back(p.to_json());
+    j["models"] = json::object();
+    for (const auto& [id, model] : cfg.models) j["models"][id] = model.to_json();
+    j["aliases"] = json::object();
+    j["model_aliases"] = json::object();
+    for (const auto& [alias, model_id] : cfg.aliases) {
+        j["aliases"][alias] = model_id;
+        const ModelConfig* model = cfg.findModel(model_id);
+        if (model) {
+            j["model_aliases"][alias] = model->provider + ":" + model->upstream_model;
+        }
+    }
+    return j;
+}
+
+static void cancel_stream_buffer(const std::shared_ptr<StreamBuffer>& buf,
+                                 bool peer_disconnect = false) {
+    std::function<void()> cancel_upstream;
+    {
+        std::lock_guard<std::mutex> lock(buf->mtx);
+        if (buf->cancelled) {
+            if (peer_disconnect) {
+                buf->client_disconnected = true;
+            }
+            return;
+        }
+        buf->cancelled = true;
+        if (peer_disconnect) {
+            buf->client_disconnected = true;
+        }
+        cancel_upstream = buf->cancel_upstream;
+    }
+    buf->cv.notify_all();
+    if (cancel_upstream) {
+        cancel_upstream();
+    }
+}
+
+// ─── SSE content provider helper ───────────────────────────────────────────
+// Reads from a StreamBuffer and writes SSE events to the httplib sink.
+static void sse_provider(std::shared_ptr<StreamBuffer> buf,
+                         httplib::DataSink& sink)
+{
+    std::unique_lock<std::mutex> lock(buf->mtx);
+    while (true) {
+        if (sink.is_writable && !sink.is_writable()) {
+            lock.unlock();
+            cancel_stream_buffer(buf, true);
+            return;
+        }
+
+        // Wait for data, completion, or error
+        buf->cv.wait_for(lock, std::chrono::milliseconds(200), [&]() {
+            return !buf->chunks.empty() || buf->completed || buf->error || buf->cancelled;
+        });
+
+        if (buf->cancelled) {
+            return;
+        }
+
+        // Drain available chunks
+        while (!buf->chunks.empty()) {
+            if (sink.is_writable && !sink.is_writable()) {
+                lock.unlock();
+                cancel_stream_buffer(buf, true);
+                return;
+            }
+
+            std::string chunk = std::move(buf->chunks.front());
+            buf->chunks.pop();
+            if (buf->buffered_bytes >= chunk.size()) {
+                buf->buffered_bytes -= chunk.size();
+            } else {
+                buf->buffered_bytes = 0;
+            }
+            buf->cv.notify_all();
+
+            lock.unlock();
+            if (!sink.write(chunk.data(), chunk.size())) {
+                // Client disconnected
+                cancel_stream_buffer(buf, true);
+                return;
+            }
+            lock.lock();
+        }
+
+        if (buf->completed || buf->error) {
+            if (buf->error && !buf->error_msg.empty()) {
+                // Write error as a final event
+                std::string err_event = "event: error\ndata: " +
+                    normalize_error_payload(500, buf->error_msg) + "\n\n";
+                lock.unlock();
+                sink.write(err_event.data(), err_event.size());
+                lock.lock();
+            }
+            break;
+        }
+    }
+    sink.done();
+}
+
+// ─── Route handlers ────────────────────────────────────────────────────────
+
+// GET /v1/models — list all available model aliases
+static void handle_list_models(const httplib::Request&, httplib::Response& res) {
+    Config cfg = get_config_snapshot();
+    res.set_content(ProviderRouter::instance().listModels(cfg),
+                    "application/json");
+}
+
+// POST /v1/messages — Anthropic Messages API compatible endpoint
+static void handle_messages(const httplib::Request& req, httplib::Response& res) {
+    bool parse_ok;
+    json body = parse_json_body(req, parse_ok);
+    if (!parse_ok) {
+        g_monitor_counters.total_requests.fetch_add(1, std::memory_order_relaxed);
+        g_monitor_counters.total_request_errors.fetch_add(1, std::memory_order_relaxed);
+        res.status = 400;
+        res.set_content(make_error("invalid_request_error", "Invalid JSON body"),
+                        "application/json");
+        return;
+    }
+
+    bool stream = body.value("stream", false);
+    const std::string requested_model = body.value("model", std::string());
+    g_monitor_counters.total_requests.fetch_add(1, std::memory_order_relaxed);
+    if (stream) {
+        g_monitor_counters.total_stream_requests.fetch_add(1, std::memory_order_relaxed);
+    } else {
+        g_monitor_counters.total_nonstream_requests.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    Config cfg = get_config_snapshot();
+
+    if (stream) {
+        // ─── Streaming response ───────────────────────────────────────────
+        auto buf = std::make_shared<StreamBuffer>();
+        int status_code = 503;
+
+        // Start backend request in background
+        ProviderRouter::instance().chatStream(cfg, req.body, buf, status_code);
+
+        if (status_code >= 400) {
+            std::string error_payload;
+            {
+                std::lock_guard<std::mutex> buf_lock(buf->mtx);
+                error_payload = buf->error_msg;
+            }
+            g_monitor_counters.total_request_errors.fetch_add(1, std::memory_order_relaxed);
+            res.status = status_code;
+            res.set_content(normalize_error_payload(status_code, error_payload),
+                            "application/json");
+            return;
+        }
+
+        register_stream_monitor(buf, requested_model);
+
+        // SSE response
+        res.status = 200;
+        res.set_header("Content-Type", "text/event-stream");
+        res.set_header("Cache-Control", "no-cache");
+        res.set_header("Connection", "keep-alive");
+
+        res.set_chunked_content_provider("text/event-stream",
+            [buf](size_t /*offset*/, httplib::DataSink& sink) {
+                sse_provider(buf, sink);
+                return true;
+            },
+            [buf](bool success) {
+                if (!success) {
+                    cancel_stream_buffer(buf, true);
+                }
+                finalize_stream_monitor(buf);
+            }
+        );
+
+    } else {
+        // ─── Non-streaming response ──────────────────────────────────────
+        int status_code = 503;
+        std::string result = ProviderRouter::instance().chat(
+            cfg, req.body, status_code);
+        if (status_code >= 400) {
+            g_monitor_counters.total_request_errors.fetch_add(1, std::memory_order_relaxed);
+        }
+        res.status = status_code;
+        res.set_content(result, "application/json");
+    }
+}
+
+// GET / — web UI
+static void handle_webui(const httplib::Request&, httplib::Response& res) {
+    res.set_content(WEBUI_HTML, "text/html; charset=utf-8");
+}
+
+// GET /api/config — get current configuration
+static void handle_get_config(const httplib::Request&, httplib::Response& res) {
+    res.set_content(config_to_json(get_config_snapshot()).dump(2), "application/json");
+}
+
+// GET /api/monitor — lightweight runtime metrics and active stream view
+static void handle_get_monitor(const httplib::Request&, httplib::Response& res) {
+    const Config cfg = get_config_snapshot();
+    const auto now_wall = std::chrono::system_clock::now();
+    const auto now_steady = std::chrono::steady_clock::now();
+
+    json streams = json::array();
+    size_t total_buffered_bytes = 0;
+
+    {
+        std::lock_guard<std::mutex> lock(g_active_streams_mutex);
+        for (const auto& [stream_id, monitor] : g_active_streams) {
+            json stream_json;
+            stream_json["id"] = stream_id;
+            stream_json["model"] = monitor.model;
+            stream_json["started_at_unix_ms"] = unix_ms_since_epoch(monitor.started_at);
+            stream_json["age_seconds"] = std::chrono::duration_cast<std::chrono::seconds>(
+                now_wall - monitor.started_at).count();
+
+            size_t buffered_bytes = 0;
+            size_t queued_chunks = 0;
+            bool completed = false;
+            bool error = false;
+            bool cancelled = false;
+            bool client_disconnected = false;
+
+            {
+                std::lock_guard<std::mutex> buf_lock(monitor.buffer->mtx);
+                buffered_bytes = monitor.buffer->buffered_bytes;
+                queued_chunks = monitor.buffer->chunks.size();
+                completed = monitor.buffer->completed;
+                error = monitor.buffer->error;
+                cancelled = monitor.buffer->cancelled;
+                client_disconnected = monitor.buffer->client_disconnected;
+            }
+
+            total_buffered_bytes += buffered_bytes;
+            stream_json["buffered_bytes"] = buffered_bytes;
+            stream_json["queued_chunks"] = queued_chunks;
+            stream_json["completed"] = completed;
+            stream_json["error"] = error;
+            stream_json["cancelled"] = cancelled;
+            stream_json["client_disconnected"] = client_disconnected;
+            streams.push_back(std::move(stream_json));
+        }
+    }
+
+    json monitor;
+    monitor["started_at_unix_ms"] = unix_ms_since_epoch(g_monitor_started_wall);
+    monitor["uptime_seconds"] = std::chrono::duration_cast<std::chrono::seconds>(
+        now_steady - g_monitor_started_steady).count();
+    monitor["runtime"] = {
+        {"process_id", GetCurrentProcessId()},
+        {"thread_count", get_current_process_thread_count()},
+        {"providers", cfg.providers.size()},
+        {"models", cfg.models.size()},
+        {"aliases", cfg.aliases.size()},
+        {"active_streams", streams.size()},
+        {"buffered_bytes", total_buffered_bytes},
+        {"configured_thread_pool_size", cfg.thread_pool_size},
+        {"effective_thread_pool_size", g_effective_thread_pool_size},
+        {"thread_pool_mode", cfg.thread_pool_size == 0 ? "unbounded" : "fixed"},
+        {"console_visible", g_console_visible},
+        {"config_path", redact_local_path(Config::getConfigPath())},
+        {"log_path", redact_local_path(get_runtime_log_path())},
+        {"listener", std::string("http://") + cfg.bind + ":" + std::to_string(cfg.port)},
+        {"webui", std::string("http://") + cfg.bind + ":" + std::to_string(cfg.port) + "/"}
+    };
+    monitor["counters"] = {
+        {"total_requests", g_monitor_counters.total_requests.load(std::memory_order_relaxed)},
+        {"total_stream_requests", g_monitor_counters.total_stream_requests.load(std::memory_order_relaxed)},
+        {"total_nonstream_requests", g_monitor_counters.total_nonstream_requests.load(std::memory_order_relaxed)},
+        {"total_request_errors", g_monitor_counters.total_request_errors.load(std::memory_order_relaxed)},
+        {"total_stream_completions", g_monitor_counters.total_stream_completions.load(std::memory_order_relaxed)},
+        {"total_stream_cancellations", g_monitor_counters.total_stream_cancellations.load(std::memory_order_relaxed)},
+        {"total_stream_disconnects", g_monitor_counters.total_stream_disconnects.load(std::memory_order_relaxed)},
+        {"total_config_saves", g_monitor_counters.total_config_saves.load(std::memory_order_relaxed)},
+        {"total_provider_tests", g_monitor_counters.total_provider_tests.load(std::memory_order_relaxed)}
+    };
+    monitor["streams"] = std::move(streams);
+
+    res.set_content(monitor.dump(2), "application/json");
+}
+
+// POST /api/config — update configuration
+static void handle_post_config(const httplib::Request& req, httplib::Response& res) {
+    bool ok;
+    json j = parse_json_body(req, ok);
+    if (!ok) {
+        res.status = 400;
+        res.set_content(make_error("invalid_request_error", "Invalid JSON"),
+                        "application/json");
+        return;
+    }
+
+    try {
+        Config saved;
+        {
+            std::lock_guard<std::mutex> lock(g_config_mutex);
+            Config updated = g_config;
+
+            if (j.contains("port") && j["port"].is_number_integer())
+                updated.port = j["port"].get<int>();
+            if (j.contains("bind") && j["bind"].is_string())
+                updated.bind = j["bind"].get<std::string>();
+            if (j.contains("thread_pool_size")) {
+                if (!j["thread_pool_size"].is_number_integer()) {
+                    res.status = 400;
+                    res.set_content(make_error("invalid_request_error", "thread_pool_size must be an integer"),
+                                    "application/json");
+                    return;
+                }
+                const int thread_pool_size = j["thread_pool_size"].get<int>();
+                if (thread_pool_size < 0) {
+                    res.status = 400;
+                    res.set_content(make_error("invalid_request_error", "thread_pool_size must be >= 0"),
+                                    "application/json");
+                    return;
+                }
+                updated.thread_pool_size = thread_pool_size;
+            }
+            if (j.contains("providers") && j["providers"].is_array()) {
+                updated.providers.clear();
+                for (const auto& p : j["providers"])
+                    updated.providers.push_back(ProviderConfig::from_json(p));
+            }
+            if (j.contains("models") && j["models"].is_object()) {
+                updated.models.clear();
+                for (auto& [k, v] : j["models"].items()) {
+                    ModelConfig model = ModelConfig::from_json(v, k);
+                    if (model.id.empty()) model.id = k;
+                    updated.models[model.id] = model;
+                }
+            }
+            if (j.contains("aliases") && j["aliases"].is_object()) {
+                updated.aliases.clear();
+                for (auto& [k, v] : j["aliases"].items()) {
+                    if (v.is_string()) updated.aliases[k] = v.get<std::string>();
+                }
+            }
+            if (j.contains("model_aliases") && j["model_aliases"].is_object()) {
+                if (!j.contains("models") && !j.contains("aliases")) {
+                    updated.models.clear();
+                    updated.aliases.clear();
+                    for (auto& [k, v] : j["model_aliases"].items()) {
+                        if (!v.is_string()) continue;
+                        const std::string target = v.get<std::string>();
+                        auto colon = target.find(':');
+                        if (colon == std::string::npos) continue;
+
+                        ModelConfig model;
+                        model.id = k;
+                        model.provider = target.substr(0, colon);
+                        model.upstream_model = target.substr(colon + 1);
+                        updated.models[model.id] = model;
+                        updated.aliases[k] = model.id;
+                    }
+                }
+            }
+
+            updated.save();
+            g_config = updated;
+            saved = g_config;
+        }
+
+        g_monitor_counters.total_config_saves.fetch_add(1, std::memory_order_relaxed);
+
+        res.set_content(config_to_json(saved).dump(2), "application/json");
+    } catch (std::exception& e) {
+        res.status = 500;
+        res.set_content(make_error("api_error", std::string("Save failed: ") + e.what()),
+                        "application/json");
+    }
+}
+
+// GET /api/config/test — test a provider connection
+static void handle_test_provider(const httplib::Request& req, httplib::Response& res) {
+    g_monitor_counters.total_provider_tests.fetch_add(1, std::memory_order_relaxed);
+    auto provider_id = req.get_param_value("provider_id");
+    if (provider_id.empty()) {
+        res.status = 400;
+        res.set_content(make_error("invalid_request_error", "provider_id required"),
+                        "application/json");
+        return;
+    }
+
+    ProviderConfig pcfg;
+    {
+        std::lock_guard<std::mutex> lock(g_config_mutex);
+        const ProviderConfig* found = g_config.findProvider(provider_id);
+        if (!found) {
+            res.status = 404;
+            res.set_content(make_error("not_found", "Provider not found: " + provider_id),
+                            "application/json");
+            return;
+        }
+        pcfg = *found;
+    }
+
+    try {
+        std::string url = pcfg.base_url;
+        // For Anthropic providers, test with /v1/models
+        // For OpenAI, use /v1/models
+        std::string test_path;
+        if (pcfg.type == "anthropic") {
+            test_path = "/v1/models";
+        } else {
+            test_path = "/models";
+        }
+
+        HttpClient client;
+        auto api_resp = client.get(url + test_path, {}, 15000);
+
+        json result;
+        result["status"] = (api_resp.status_code >= 200 && api_resp.status_code < 300)
+                          ? "ok" : "error";
+        result["status_code"] = api_resp.status_code;
+        result["provider"] = pcfg.id;
+        res.set_content(result.dump(), "application/json");
+    } catch (std::exception& e) {
+        json result;
+        result["status"] = "error";
+        result["error"] = e.what();
+        res.set_content(result.dump(), "application/json");
+    }
+}
+
+// ─── Main ──────────────────────────────────────────────────────────────────
+int main(int argc, char* argv[]) {
+    StartupOptions options;
+    std::string error_message;
+    if (!parse_startup_options(argc, argv, options, error_message)) {
+        std::cerr << error_message << std::endl;
+        print_usage();
+        return 2;
+    }
+
+    if (options.show_help) {
+        print_usage();
+        return 0;
+    }
+
+    if (options.internal_daemon) {
+        return run_daemon_supervisor(options);
+    }
+
+    if (options.daemon) {
+        if (options.show_console) {
+            return run_daemon_supervisor(options);
+        }
+        return launch_detached_mode(options);
+    }
+
+    if (!options.show_console && !options.internal_run) {
+        return launch_detached_mode(options);
+    }
+
+    return run_gateway_server(options);
+}
