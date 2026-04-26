@@ -7,6 +7,7 @@
 
 namespace {
 constexpr size_t kDefaultMaxBufferedStreamBytes = 1024 * 1024;
+constexpr size_t kOutboundPreviewLimit = 96;
 
 bool push_stream_chunk(const std::shared_ptr<StreamBuffer>& out_buf, std::string chunk) {
     if (chunk.empty()) {
@@ -112,6 +113,218 @@ std::string resolved_effort_override(const ModelConfig& model_cfg) {
         return model_cfg.request_overrides.effort;
     }
     return model_cfg.effort;
+}
+
+std::string flatten_plain_text_content(const json& value) {
+    if (value.is_null()) {
+        return "";
+    }
+    if (value.is_string()) {
+        return value.get<std::string>();
+    }
+    if (value.is_array()) {
+        std::string out;
+        for (const auto& item : value) {
+            out += flatten_plain_text_content(item);
+        }
+        return out;
+    }
+    if (value.is_object()) {
+        if (value.contains("text") && value["text"].is_string()) {
+            return value["text"].get<std::string>();
+        }
+        if (value.contains("content")) {
+            return flatten_plain_text_content(value["content"]);
+        }
+        return value.dump();
+    }
+    return value.dump();
+}
+
+void append_plain_text_section(std::string& out,
+                               const std::string& section) {
+    if (section.empty()) {
+        return;
+    }
+    if (!out.empty()) {
+        out += "\n\n";
+    }
+    out += section;
+}
+
+std::string flatten_anthropic_blocks_for_openai(const json& content,
+                                                std::map<std::string, std::string>& tool_names_by_id,
+                                                std::string& reasoning_content) {
+    if (content.is_string()) {
+        return content.get<std::string>();
+    }
+
+    if (!content.is_array()) {
+        return flatten_plain_text_content(content);
+    }
+
+    std::string flattened;
+    for (const auto& block : content) {
+        if (!block.is_object()) {
+            append_plain_text_section(flattened, flatten_plain_text_content(block));
+            continue;
+        }
+
+        const std::string type = block.value("type", "text");
+        if (type == "text") {
+            append_plain_text_section(flattened, block.value("text", std::string()));
+            continue;
+        }
+
+        if (type == "thinking") {
+            reasoning_content += block.value("thinking", std::string());
+            continue;
+        }
+
+        if (type == "tool_use") {
+            const std::string tool_id = block.value("id", std::string());
+            const std::string tool_name = block.value("name", std::string());
+            if (!tool_id.empty() && !tool_name.empty()) {
+                tool_names_by_id[tool_id] = tool_name;
+            }
+
+            std::string section = "[Assistant requested tool: ";
+            section += !tool_name.empty() ? tool_name : (!tool_id.empty() ? tool_id : std::string("unknown"));
+            if (!tool_id.empty()) {
+                section += " id=" + tool_id;
+            }
+            section += "]";
+            if (block.contains("input")) {
+                section += "\n" + block["input"].dump();
+            }
+            append_plain_text_section(flattened, section);
+            continue;
+        }
+
+        if (type == "tool_result") {
+            const std::string tool_id = block.value("tool_use_id", std::string());
+            const auto tool_it = tool_names_by_id.find(tool_id);
+            const std::string tool_name = tool_it != tool_names_by_id.end()
+                ? tool_it->second
+                : (!tool_id.empty() ? tool_id : std::string("unknown"));
+            const bool is_error = block.value("is_error", false);
+            std::string section = is_error ? "[Tool error: " : "[Tool result: ";
+            section += tool_name;
+            if (!tool_id.empty()) {
+                section += " id=" + tool_id;
+            }
+            section += "]\n";
+            if (block.contains("content")) {
+                section += flatten_plain_text_content(block["content"]);
+            }
+            append_plain_text_section(flattened, section);
+            continue;
+        }
+
+        append_plain_text_section(flattened,
+            "[Unsupported block " + type + "]\n" + block.dump());
+    }
+
+    return flattened;
+}
+
+std::string summarize_preview_text(const std::string& source,
+                                   size_t max_chars = kOutboundPreviewLimit) {
+    std::string preview;
+    preview.reserve(std::min(source.size(), max_chars));
+    bool previous_space = false;
+    for (char ch : source) {
+        if (preview.size() >= max_chars) {
+            break;
+        }
+
+        const unsigned char uch = static_cast<unsigned char>(ch);
+        if (std::iscntrl(uch) || std::isspace(uch)) {
+            if (previous_space || preview.empty()) {
+                continue;
+            }
+            preview.push_back(' ');
+            previous_space = true;
+            continue;
+        }
+
+        if (ch == '\\') {
+            if (preview.size() + 2 > max_chars) {
+                break;
+            }
+            preview += "\\\\";
+            previous_space = false;
+            continue;
+        }
+
+        if (ch == '"') {
+            if (preview.size() + 2 > max_chars) {
+                break;
+            }
+            preview += "\\\"";
+            previous_space = false;
+            continue;
+        }
+
+        preview.push_back(ch);
+        previous_space = false;
+    }
+
+    if (source.size() > preview.size() && max_chars > 3) {
+        preview = preview.substr(0, std::min(preview.size(), max_chars - 3)) + "...";
+    }
+    return preview;
+}
+
+std::string extract_outbound_message_text(const json& message) {
+    auto content_it = message.find("content");
+    if (content_it == message.end()) {
+        return "";
+    }
+    return flatten_plain_text_content(*content_it);
+}
+
+void log_outbound_request_summary(const ProviderConfig& provider_cfg,
+                                  const std::string& provider_type,
+                                  const std::string& backend_body) {
+    try {
+        const json payload = json::parse(backend_body);
+        const json messages = payload.contains("messages") && payload["messages"].is_array()
+            ? payload["messages"]
+            : json::array();
+        const json tools = payload.contains("tools") && payload["tools"].is_array()
+            ? payload["tools"]
+            : json::array();
+
+        gateway_log_debug(
+            "[outbound] provider=" + provider_cfg.id +
+            " type=" + provider_type +
+            " model=" + payload.value("model", std::string()) +
+            " stream=" + (payload.value("stream", false) ? std::string("true") : std::string("false")) +
+            " messages=" + std::to_string(messages.size()) +
+            " tools=" + std::to_string(tools.size()));
+
+        for (size_t index = 0; index < messages.size(); ++index) {
+            const auto& message = messages[index];
+            const std::string role = message.value("role", "unknown");
+            const std::string text = extract_outbound_message_text(message);
+            std::string line = "[outbound] msg[" + std::to_string(index) + "] role=" + role +
+                " chars=" + std::to_string(text.size()) +
+                " preview=\"" + summarize_preview_text(text) + "\"";
+
+            if (message.contains("reasoning_content")) {
+                line += " reasoning_chars=" + std::to_string(flatten_plain_text_content(message["reasoning_content"]).size());
+            }
+            if (message.contains("tool_calls") && message["tool_calls"].is_array()) {
+                line += " tool_calls=" + std::to_string(message["tool_calls"].size());
+            }
+
+            gateway_log_debug(line);
+        }
+    } catch (const std::exception& e) {
+        gateway_log_debug("[outbound] summary_failed provider=" + provider_cfg.id +
+                          " reason=" + e.what());
+    }
 }
 }
 
@@ -383,6 +596,7 @@ std::string OpenAIProvider::transformRequest(const json& anthropic_req,
     json oai;
     oai["model"] = model_cfg.upstream_model;
     oai["messages"] = json::array();
+    std::map<std::string, std::string> tool_names_by_id;
 
     // Handle system prompt: convert to system-role message or use top-level
     bool has_system = false;
@@ -426,72 +640,15 @@ std::string OpenAIProvider::transformRequest(const json& anthropic_req,
             } else if (content.is_array()) {
                 std::string text_content;
                 std::string reasoning_content;
-                bool has_tool_calls = false;
-                json tool_calls = json::array();
-                for (const auto& block : content) {
-                    std::string type = block.value("type", "text");
-                    if (type == "text") {
-                        text_content += block.value("text", "");
-                    } else if (type == "thinking") {
-                        reasoning_content += block.value("thinking", "");
-                    } else if (type == "tool_use") {
-                        has_tool_calls = true;
-                        json tc;
-                        tc["id"] = block.value("id", "");
-                        tc["type"] = "function";
-                        tc["function"] = {
-                            {"name", block["name"].get<std::string>()},
-                            {"arguments", block["input"].dump()}
-                        };
-                        tool_calls.push_back(tc);
-                    } else if (type == "tool_result") {
-                        // Tool result → user message with tool role content
-                        json tr_msg;
-                        tr_msg["role"] = "tool";
-                        tr_msg["tool_call_id"] = block.value("tool_use_id", "");
-                        const auto& tr_content = block["content"];
-                        if (tr_content.is_string()) {
-                            tr_msg["content"] = tr_content;
-                        } else {
-                            std::string tr_text;
-                            for (const auto& tc : tr_content) {
-                                if (tc.value("type", "") == "text") {
-                                    tr_text += tc.value("text", "");
-                                }
-                            }
-                            tr_msg["content"] = tr_text;
-                        }
-                        oai["messages"].push_back(tr_msg);
-                        continue; // skip the normal push below
-                    }
-                }
+                text_content = flatten_anthropic_blocks_for_openai(content, tool_names_by_id, reasoning_content);
 
                 if (!reasoning_content.empty()) {
                     oai_msg["reasoning_content"] = reasoning_content;
                 }
 
-                if (!text_content.empty()) {
-                    oai_msg["content"] = text_content;
-                } else if (has_tool_calls) {
-                    oai_msg["content"] = nullptr;
-                } else if (!reasoning_content.empty()) {
-                    oai_msg["content"] = "";
-                }
-
-                if (!text_content.empty() || !reasoning_content.empty() || has_tool_calls) {
-                    if (!oai_msg.contains("content")) {
-                        oai_msg["content"] = nullptr;
-                    }
-                    if (has_tool_calls) {
-                        oai_msg["tool_calls"] = tool_calls;
-                    }
-                }
+                oai_msg["content"] = text_content;
             } else if (content.is_null()) {
-                // Assistant messages with tool_calls use null content
-                oai_msg["content"] = nullptr;
-                if (msg.contains("tool_calls")) {
-                    oai_msg["tool_calls"] = msg["tool_calls"];
-                }
+                oai_msg["content"] = "";
             }
 
             oai["messages"].push_back(oai_msg);
@@ -1005,6 +1162,7 @@ std::string ProviderRouter::chat(const Config& cfg,
         // Transform request
         req["stream"] = false; // Ensure non-streaming for this path
         std::string backend_body = provider->transformRequest(req, model_cfg);
+        log_outbound_request_summary(*pcfg, provider_type, backend_body);
         std::string url = pcfg->base_url + provider->getEndpoint();
         auto headers = merge_request_headers(provider->getHeaders(*pcfg), request_context);
 
@@ -1207,6 +1365,7 @@ void ProviderRouter::chatStream(const Config& cfg,
 
         const ProviderConfig provider_cfg = *pcfg;
         const std::string backend_body = provider->transformRequest(req, model_cfg);
+        log_outbound_request_summary(provider_cfg, provider_type, backend_body);
         const std::string url = provider_cfg.base_url + provider->getEndpoint();
         const auto headers = merge_request_headers(provider->getHeaders(provider_cfg), request_context);
 

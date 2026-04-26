@@ -2,6 +2,7 @@
 #include <sstream>
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <fstream>
 #include <iomanip>
 #include <map>
@@ -27,6 +28,7 @@ static void handle_get_config(const httplib::Request&, httplib::Response& res);
 static void handle_get_monitor(const httplib::Request&, httplib::Response& res);
 static void handle_post_config(const httplib::Request& req, httplib::Response& res);
 static void handle_test_provider(const httplib::Request& req, httplib::Response& res);
+static void log_debug(const std::string& message, bool show_console);
 static void log_info(const std::string& message, bool show_console);
 static void log_warn(const std::string& message, bool show_console);
 static void log_error(const std::string& message, bool show_console);
@@ -295,6 +297,17 @@ static void log_info(const std::string& message, bool show_console) {
     }
 }
 
+static void log_debug(const std::string& message, bool show_console) {
+    append_runtime_log("DEBUG", message);
+    if (show_console) {
+        std::cout << message << std::endl;
+    }
+}
+
+void gateway_log_debug(const std::string& message) {
+    log_debug(message, false);
+}
+
 static void log_warn(const std::string& message, bool show_console) {
     append_runtime_log("WARN", message);
     if (show_console) {
@@ -314,6 +327,257 @@ static void print_usage() {
     std::cout << "  --show    Run in the current console instead of detaching to background." << std::endl;
     std::cout << "  --daemon  Launch a supervisor that restarts the worker if it exits." << std::endl;
     std::cout << "  port      Optional port override for this launch." << std::endl;
+}
+
+struct DebugContentSummary {
+    size_t char_count = 0;
+    bool empty = true;
+    std::string preview;
+};
+
+static void append_preview_text(const std::string& source,
+                                std::string& out,
+                                size_t max_chars) {
+    bool previous_space = !out.empty() && out.back() == ' ';
+    for (char ch : source) {
+        if (out.size() >= max_chars) {
+            break;
+        }
+
+        const unsigned char uch = static_cast<unsigned char>(ch);
+        if (std::iscntrl(uch)) {
+            if (!previous_space && !out.empty()) {
+                out.push_back(' ');
+                previous_space = true;
+            }
+            continue;
+        }
+
+        if (std::isspace(uch)) {
+            if (previous_space || out.empty()) {
+                continue;
+            }
+            out.push_back(' ');
+            previous_space = true;
+            continue;
+        }
+
+        out.push_back(ch);
+        previous_space = false;
+    }
+}
+
+static size_t debug_content_char_count(const json& value) {
+    if (value.is_null()) {
+        return 0;
+    }
+    if (value.is_string()) {
+        return value.get<std::string>().size();
+    }
+    if (value.is_array()) {
+        size_t total = 0;
+        for (const auto& item : value) {
+            total += debug_content_char_count(item);
+        }
+        return total;
+    }
+    if (value.is_object()) {
+        auto text_it = value.find("text");
+        if (text_it != value.end() && text_it->is_string()) {
+            return text_it->get<std::string>().size();
+        }
+        auto content_it = value.find("content");
+        if (content_it != value.end()) {
+            return debug_content_char_count(*content_it);
+        }
+        return value.dump().size();
+    }
+    return value.dump().size();
+}
+
+static void append_debug_content_preview(const json& value,
+                                         std::string& out,
+                                         size_t max_chars) {
+    if (out.size() >= max_chars || value.is_null()) {
+        return;
+    }
+
+    if (value.is_string()) {
+        append_preview_text(value.get<std::string>(), out, max_chars);
+        return;
+    }
+
+    if (value.is_array()) {
+        for (const auto& item : value) {
+            append_debug_content_preview(item, out, max_chars);
+            if (out.size() >= max_chars) {
+                break;
+            }
+        }
+        return;
+    }
+
+    if (value.is_object()) {
+        auto text_it = value.find("text");
+        if (text_it != value.end() && text_it->is_string()) {
+            append_preview_text(text_it->get<std::string>(), out, max_chars);
+            return;
+        }
+        auto content_it = value.find("content");
+        if (content_it != value.end()) {
+            append_debug_content_preview(*content_it, out, max_chars);
+            return;
+        }
+        append_preview_text(value.dump(), out, max_chars);
+        return;
+    }
+
+    append_preview_text(value.dump(), out, max_chars);
+}
+
+static std::string escape_debug_preview(const std::string& preview) {
+    std::string escaped;
+    escaped.reserve(preview.size());
+    for (char ch : preview) {
+        if (ch == '\\') {
+            escaped += "\\\\";
+        } else if (ch == '"') {
+            escaped += "\\\"";
+        } else {
+            escaped.push_back(ch);
+        }
+    }
+    return escaped;
+}
+
+static DebugContentSummary summarize_debug_content(const json& value,
+                                                  size_t preview_limit = 96) {
+    DebugContentSummary summary;
+    summary.char_count = debug_content_char_count(value);
+    summary.empty = summary.char_count == 0;
+    append_debug_content_preview(value, summary.preview, preview_limit);
+    if (summary.preview.size() == preview_limit && summary.char_count > summary.preview.size() &&
+        preview_limit > 3) {
+        summary.preview = summary.preview.substr(0, preview_limit - 3) + "...";
+    }
+    summary.preview = escape_debug_preview(summary.preview);
+    return summary;
+}
+
+static std::string summarize_message_block(const json& block,
+                                           std::map<std::string, std::string>& tool_names_by_id,
+                                           std::vector<std::string>& debug_lines) {
+    if (block.is_string()) {
+        return "text:" + std::to_string(block.get<std::string>().size());
+    }
+
+    if (!block.is_object()) {
+        return "json:" + std::to_string(debug_content_char_count(block));
+    }
+
+    const std::string type = block.value("type", "object");
+    if (type == "text") {
+        return "text:" + std::to_string(block.value("text", std::string()).size());
+    }
+
+    if (type == "tool_use") {
+        const std::string tool_id = block.value("id", std::string());
+        const std::string tool_name = block.value("name", std::string());
+        if (!tool_id.empty() && !tool_name.empty()) {
+            tool_names_by_id[tool_id] = tool_name;
+        }
+        if (!tool_name.empty()) {
+            return "tool_use:" + tool_name;
+        }
+        if (!tool_id.empty()) {
+            return "tool_use:" + tool_id;
+        }
+        return "tool_use";
+    }
+
+    if (type == "tool_result") {
+        const std::string tool_id = block.value("tool_use_id", std::string());
+        const auto tool_it = tool_names_by_id.find(tool_id);
+        const std::string tool_label = tool_it != tool_names_by_id.end()
+            ? tool_it->second
+            : (!tool_id.empty() ? tool_id : "unknown");
+        const json content = block.contains("content") ? block["content"] : json();
+        const DebugContentSummary summary = summarize_debug_content(content, 96);
+        debug_lines.push_back(
+            "[debug] tool_result id=" + (tool_id.empty() ? std::string("<missing>") : tool_id) +
+            " chars=" + std::to_string(summary.char_count) +
+            " empty=" + (summary.empty ? "true" : "false") +
+            " preview=\"" + summary.preview + "\"");
+        return "tool_result:" + tool_label +
+               " chars=" + std::to_string(summary.char_count) +
+               " empty=" + (summary.empty ? "true" : "false");
+    }
+
+    if (type == "image") {
+        return "image";
+    }
+
+    if (type == "document") {
+        return "document";
+    }
+
+    if (block.contains("text") && block["text"].is_string()) {
+        return type + ":" + std::to_string(block["text"].get<std::string>().size());
+    }
+
+    return type;
+}
+
+static void log_request_structure_debug(const json& body) {
+    const bool stream = body.value("stream", false);
+    const std::string requested_model = body.value("model", std::string());
+    const json messages = body.contains("messages") ? body["messages"] : json::array();
+    const size_t message_count = messages.is_array() ? messages.size() : 0;
+
+    log_debug("[debug] request model=" + requested_model +
+              " stream=" + (stream ? std::string("true") : std::string("false")) +
+              " messages=" + std::to_string(message_count), false);
+
+    if (!messages.is_array()) {
+        return;
+    }
+
+    std::map<std::string, std::string> tool_names_by_id;
+    for (size_t index = 0; index < messages.size(); ++index) {
+        const auto& message = messages[index];
+        const std::string role = message.value("role", "unknown");
+
+        std::vector<std::string> block_summaries;
+        std::vector<std::string> debug_lines;
+        auto content_it = message.find("content");
+        if (content_it == message.end()) {
+            block_summaries.push_back("missing");
+        } else if (content_it->is_array()) {
+            for (const auto& block : *content_it) {
+                block_summaries.push_back(summarize_message_block(block, tool_names_by_id, debug_lines));
+            }
+        } else {
+            block_summaries.push_back(summarize_message_block(*content_it, tool_names_by_id, debug_lines));
+        }
+
+        if (block_summaries.empty()) {
+            block_summaries.push_back("empty");
+        }
+
+        std::ostringstream blocks_stream;
+        for (size_t block_index = 0; block_index < block_summaries.size(); ++block_index) {
+            if (block_index > 0) {
+                blocks_stream << ", ";
+            }
+            blocks_stream << block_summaries[block_index];
+        }
+
+        log_debug("[debug] msg[" + std::to_string(index) + "] role=" + role +
+                  " blocks=[" + blocks_stream.str() + "]", false);
+        for (const auto& line : debug_lines) {
+            log_debug(line, false);
+        }
+    }
 }
 
 static bool try_parse_port(const std::string& value, int& port) {
@@ -949,6 +1213,7 @@ static void handle_messages(const httplib::Request& req, httplib::Response& res)
 
     bool stream = body.value("stream", false);
     const std::string requested_model = body.value("model", std::string());
+    log_request_structure_debug(body);
     g_monitor_counters.total_requests.fetch_add(1, std::memory_order_relaxed);
     note_session_request(request_context.session_id, requested_model, stream);
     log_session_event(request_context.session_id,

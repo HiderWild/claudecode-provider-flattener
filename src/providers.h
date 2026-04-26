@@ -16,6 +16,7 @@ struct GatewayRequestContext {
 // ─── Utility ────────────────────────────────────────────────────────────────
 std::string generate_message_id();
 std::string json_string_or(const json& j, const std::string& key, const std::string& def);
+void gateway_log_debug(const std::string& message);
 
 // ─── Provider base ──────────────────────────────────────────────────────────
 class ProviderBase {
