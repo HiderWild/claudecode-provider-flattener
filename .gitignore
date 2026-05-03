@@ -1,5 +1,6 @@
 # Build outputs
 /build/
+build/
 /dist/
 /cmake-build-*/
 CMakeCache.txt
@@ -23,6 +24,7 @@ compile_commands.json
 *.bak-*
 .omc/
 **/.omc/
+.claude/
 
 # Editor and OS noise
 .vscode/
