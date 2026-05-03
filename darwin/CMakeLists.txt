@@ -4,7 +4,8 @@ project(model-gateway VERSION 1.0.0 LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-add_definitions(-DCPPHTTPLIB_NO_SSL)
+find_package(OpenSSL REQUIRED)
+add_definitions(-DCPPHTTPLIB_OPENSSL_SUPPORT)
 
 set(SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/main.cpp
@@ -22,4 +23,11 @@ target_include_directories(model-gateway PRIVATE
 )
 
 find_package(Threads REQUIRED)
-target_link_libraries(model-gateway Threads::Threads)
+target_link_libraries(model-gateway
+    Threads::Threads
+    OpenSSL::SSL
+    OpenSSL::Crypto
+    "-framework Security"
+    "-framework CoreFoundation"
+    "-framework CFNetwork"
+)

@@ -4,16 +4,24 @@ project(model-gateway VERSION 1.0.0 LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-add_definitions(-DCPPHTTPLIB_NO_SSL)
-
 if(WIN32)
+    add_definitions(-DCPPHTTPLIB_NO_SSL)
     add_definitions(-D_WIN32_WINNT=0x0A00)
     set(PLATFORM_DIR win32)
     set(PLATFORM_LIBS ws2_32 winhttp)
 elseif(APPLE)
     set(PLATFORM_DIR darwin)
     find_package(Threads REQUIRED)
-    set(PLATFORM_LIBS Threads::Threads)
+    find_package(OpenSSL REQUIRED)
+    add_definitions(-DCPPHTTPLIB_OPENSSL_SUPPORT)
+    set(PLATFORM_LIBS
+        Threads::Threads
+        OpenSSL::SSL
+        OpenSSL::Crypto
+        "-framework Security"
+        "-framework CoreFoundation"
+        "-framework CFNetwork"
+    )
 else()
     message(FATAL_ERROR "Unsupported platform")
 endif()

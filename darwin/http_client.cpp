@@ -5,6 +5,7 @@
 #include <iostream>
 #include <thread>
 #include <algorithm>
+#include <memory>
 
 // ─── URL parsing ────────────────────────────────────────────────────────────
 
@@ -72,6 +73,17 @@ static httplib::Headers build_headers(const std::map<std::string, std::string>& 
     return h;
 }
 
+static std::unique_ptr<httplib::ClientImpl> make_client(const std::string& host, int port, bool is_https) {
+    if (is_https) {
+#ifdef CPPHTTPLIB_OPENSSL_SUPPORT
+        return std::make_unique<httplib::SSLClient>(host, port);
+#else
+        return nullptr;
+#endif
+    }
+    return std::make_unique<httplib::ClientImpl>(host, port);
+}
+
 // ─── GET ────────────────────────────────────────────────────────────────────
 
 HttpClient::Response HttpClient::get(
@@ -83,10 +95,15 @@ HttpClient::Response HttpClient::get(
     Response resp;
 
     try {
-        httplib::Client cli(parts.host, parts.port);
-        cli.set_connection_timeout(std::chrono::milliseconds(timeout_ms));
-        cli.set_read_timeout(std::chrono::milliseconds(timeout_ms));
-        auto result = cli.Get(parts.path, build_headers(headers));
+        auto cli = make_client(parts.host, parts.port, parts.is_https);
+        if (!cli) {
+            resp.status_code = 503;
+            std::cerr << "[http] GET HTTPS requested without SSL support" << std::endl;
+            return resp;
+        }
+        cli->set_connection_timeout(std::chrono::milliseconds(timeout_ms));
+        cli->set_read_timeout(std::chrono::milliseconds(timeout_ms));
+        auto result = cli->Get(parts.path, build_headers(headers));
         if (result) {
             resp.status_code = result->status;
             resp.body = result->body;
@@ -115,10 +132,15 @@ HttpClient::Response HttpClient::post(
     Response resp;
 
     try {
-        httplib::Client cli(parts.host, parts.port);
-        cli.set_connection_timeout(std::chrono::milliseconds(timeout_ms));
-        cli.set_read_timeout(std::chrono::milliseconds(timeout_ms));
-        auto result = cli.Post(parts.path, build_headers(headers), body, content_type);
+        auto cli = make_client(parts.host, parts.port, parts.is_https);
+        if (!cli) {
+            resp.status_code = 503;
+            std::cerr << "[http] POST HTTPS requested without SSL support" << std::endl;
+            return resp;
+        }
+        cli->set_connection_timeout(std::chrono::milliseconds(timeout_ms));
+        cli->set_read_timeout(std::chrono::milliseconds(timeout_ms));
+        auto result = cli->Post(parts.path, build_headers(headers), body, content_type);
         if (result) {
             resp.status_code = result->status;
             resp.body = result->body;
@@ -156,12 +178,18 @@ HttpClient::Response HttpClient::postStream(
     };
 
     try {
-        httplib::Client cli(parts.host, parts.port);
-        cli.set_connection_timeout(std::chrono::milliseconds(timeout_ms));
-        cli.set_read_timeout(std::chrono::milliseconds(timeout_ms));
+        auto cli = make_client(parts.host, parts.port, parts.is_https);
+        if (!cli) {
+            resp.status_code = 503;
+            notify_status(503);
+            std::cerr << "[http] POST stream HTTPS requested without SSL support" << std::endl;
+            return resp;
+        }
+        cli->set_connection_timeout(std::chrono::milliseconds(timeout_ms));
+        cli->set_read_timeout(std::chrono::milliseconds(timeout_ms));
 
         // Use ContentReceiver-based Post for streaming
-        auto result = cli.Post(parts.path, build_headers(headers), body, content_type,
+        auto result = cli->Post(parts.path, build_headers(headers), body, content_type,
             [&](const char* data, size_t len) {
                 if (stream_control && stream_control->is_cancelled()) {
                     return false;
