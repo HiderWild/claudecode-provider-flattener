@@ -88,13 +88,20 @@ body{font-family:'Segoe UI',Tahoma,sans-serif;background:radial-gradient(circle 
 .empty{padding:18px;border:1px dashed #d5dfec;border-radius:16px;background:#f9fbff;color:var(--muted);font-size:13px;text-align:center}
 .save-bar{position:sticky;bottom:0;display:flex;justify-content:space-between;align-items:center;gap:12px;padding:14px 18px;margin-top:18px;background:rgba(255,255,255,.92);border:1px solid rgba(216,223,236,.95);border-radius:18px;box-shadow:0 10px 30px rgba(18,38,63,.08);backdrop-filter:blur(12px)}
 .save-bar-actions{display:flex;gap:8px;flex-wrap:wrap}
+.tab-nav{display:flex;gap:10px;margin-bottom:16px;padding:6px;background:rgba(255,255,255,.76);border:1px solid rgba(216,223,236,.9);border-radius:18px;box-shadow:0 10px 24px rgba(18,38,63,.05)}
+.tab-button{flex:1;border:0;background:transparent;color:var(--muted);padding:12px 14px;border-radius:13px;font-size:14px;font-weight:700;cursor:pointer;transition:background .16s ease,color .16s ease,box-shadow .16s ease}
+.tab-button:hover,.tab-button:focus{outline:none;color:var(--brand);background:var(--brand-soft)}
+.tab-button.active{background:var(--brand);color:#fff;box-shadow:0 8px 18px rgba(19,103,209,.2)}
+.tab-panel{display:none}
+.tab-panel.active{display:block}
+.single-column{display:grid;gap:16px}
 #toast{position:fixed;bottom:24px;right:24px;padding:12px 18px;border-radius:14px;color:#fff;font-size:14px;z-index:1000;opacity:0;transform:translateY(10px);transition:opacity .25s,transform .25s;pointer-events:none;box-shadow:0 16px 32px rgba(15,23,42,.18)}
 #toast.show{opacity:1;transform:translateY(0)}
 #toast.success{background:var(--success)}
 #toast.error{background:var(--danger)}
 #toast.info{background:var(--brand)}
 @media (max-width:960px){.status-bar{grid-template-columns:1fr 1fr}.layout{grid-template-columns:1fr}.hero{flex-direction:column}.save-bar{flex-direction:column;align-items:stretch}.save-bar-actions{justify-content:flex-end}}
-@media (max-width:640px){body{padding:14px}.status-bar{grid-template-columns:1fr}.monitor-grid{grid-template-columns:1fr}.row{flex-direction:column}.alias-item{flex-direction:column;align-items:flex-start}.provider-actions{align-items:flex-start}}
+@media (max-width:640px){body{padding:14px}.status-bar{grid-template-columns:1fr}.monitor-grid{grid-template-columns:1fr}.row{flex-direction:column}.alias-item{flex-direction:column;align-items:flex-start}.provider-actions{align-items:flex-start}.tab-nav{flex-direction:column}}
 </style>
 </head>
 <body>
@@ -102,188 +109,160 @@ body{font-family:'Segoe UI',Tahoma,sans-serif;background:radial-gradient(circle 
 <div class="hero">
   <div>
     <h1>Model Gateway 控制面板</h1>
-    <p>同一页面查看网关运行态、活跃流、线程池配置和 Provider 路由信息。监控面板会自动轮询 <code>/api/monitor</code>，配置保存则写回当前运行配置。</p>
+    <p>按仪表板、Provider、路由规则三个工作区管理本地模型网关。监控面板会自动轮询 <code>/api/monitor</code>，配置保存则写回当前运行配置。</p>
   </div>
   <div class="hero-actions">
     <button class="btn btn-outline" onclick="refreshAll(true)">立即刷新</button>
   </div>
 </div>
 
-<div class="status-bar">
-  <div class="status-pill">
-    <span class="status-dot" id="statusDot"></span>
-    <div>
-      <strong id="statusText">正在连接</strong>
-      <span id="statusMeta">等待监控数据...</span>
-    </div>
-  </div>
-  <div class="status-tile">
-    <div class="label">监听地址</div>
-    <div class="value" id="listenerDisplay">127.0.0.1:8080</div>
-  </div>
-  <div class="status-tile">
-    <div class="label">活跃流</div>
-    <div class="value" id="activeStreamsDisplay">0</div>
-  </div>
-  <div class="status-tile">
-    <div class="label">累计请求</div>
-    <div class="value" id="totalRequestsDisplay">0</div>
-  </div>
+<div class="tab-nav" role="tablist" aria-label="Model Gateway 工作区">
+  <button class="tab-button active" id="dashboardTabButton" role="tab" aria-selected="true" aria-controls="dashboardTab" onclick="showTab('dashboard')">仪表板</button>
+  <button class="tab-button" id="providersTabButton" role="tab" aria-selected="false" aria-controls="providersTab" onclick="showTab('providers')">Provider</button>
+  <button class="tab-button" id="routesTabButton" role="tab" aria-selected="false" aria-controls="routesTab" onclick="showTab('routes')">路由规则</button>
 </div>
 
-<div class="layout">
-  <div class="stack">
-    <div class="card">
-      <div class="provider-header">
-        <div>
-          <h2>运行监控</h2>
-          <div class="card-subtitle">默认每 3 秒刷新一次，展示当前进程、线程池、请求计数和缓存压力。</div>
-        </div>
-        <div class="pill-row">
-          <span class="pill" id="refreshStamp">最近刷新: --</span>
-          <span class="pill" id="consoleModeBadge">控制台: --</span>
-        </div>
-      </div>
-      <div class="monitor-grid">
-        <div class="metric">
-          <div class="label">运行时长</div>
-          <div class="value" id="uptimeDisplay">--</div>
-          <div class="meta" id="startedAtDisplay">启动时间 --</div>
-        </div>
-        <div class="metric">
-          <div class="label">线程池</div>
-          <div class="value" id="threadPoolDisplay">--</div>
-          <div class="meta" id="threadPoolMeta">配置值 --</div>
-        </div>
-        <div class="metric">
-          <div class="label">进程线程数</div>
-          <div class="value" id="threadCountDisplay">--</div>
-          <div class="meta" id="pidDisplay">PID --</div>
-        </div>
-        <div class="metric">
-          <div class="label">缓冲区压力</div>
-          <div class="value" id="bufferDisplay">--</div>
-          <div class="meta" id="bufferMeta">队列空闲</div>
-        </div>
-        <div class="metric">
-          <div class="label">流完成 / 取消</div>
-          <div class="value" id="streamOutcomeDisplay">0 / 0</div>
-          <div class="meta" id="streamOutcomeMeta">断连 0</div>
-        </div>
-        <div class="metric">
-          <div class="label">错误请求</div>
-          <div class="value" id="errorDisplay">0</div>
-          <div class="meta" id="requestBreakdownDisplay">普通 0 · 流式 0</div>
-        </div>
-      </div>
-      <div class="pill-row" id="runtimeInfoRow">
-        <span class="pill">配置文件: --</span>
-        <span class="pill">日志文件: --</span>
+<section id="dashboardTab" class="tab-panel active" role="tabpanel" aria-labelledby="dashboardTabButton">
+  <div class="status-bar">
+    <div class="status-pill">
+      <span class="status-dot" id="statusDot"></span>
+      <div>
+        <strong id="statusText">正在连接</strong>
+        <span id="statusMeta">等待监控数据...</span>
       </div>
     </div>
-
-    <div class="card">
-      <div class="provider-header">
-        <div>
-          <h2>活跃流</h2>
-          <div class="card-subtitle">显示当前正在向客户端输出 SSE 的请求和缓冲状态。</div>
-        </div>
-      </div>
-      <div id="streamsContainer" class="empty">当前没有活跃流。</div>
+    <div class="status-tile">
+      <div class="label">监听地址</div>
+      <div class="value" id="listenerDisplay">127.0.0.1:8080</div>
     </div>
-
-    <div class="card">
-      <div class="provider-header">
-        <div>
-          <h2>会话概览</h2>
-          <div class="card-subtitle">按 Claude Code 会话维度聚合请求、活跃流、错误和 count_tokens 调用。</div>
-        </div>
-      </div>
-      <div id="sessionsContainer" class="empty">当前还没有会话级监控数据。</div>
+    <div class="status-tile">
+      <div class="label">活跃流</div>
+      <div class="value" id="activeStreamsDisplay">0</div>
     </div>
-
-    <div class="card">
-      <h2>通用设置</h2>
-      <div class="row">
-        <div class="form-group">
-          <label>监听端口</label>
-          <input type="number" id="port" value="8080" min="1024" max="65535" onchange="markUnsaved()">
-        </div>
-        <div class="form-group">
-          <label>绑定地址</label>
-          <input type="text" id="bind" value="127.0.0.1" onchange="markUnsaved()">
-        </div>
-      </div>
-      <div class="row">
-        <div class="form-group">
-          <label>线程池大小</label>
-          <input type="number" id="threadPoolSize" value="8" min="0" onchange="markUnsaved()">
-        </div>
-        <div class="form-group">
-          <label>说明</label>
-          <div class="tiny" style="padding-top:10px">`0` 表示不设上限，网关会按需动态扩容；大于 `0` 时按固定工作线程启动。这个值在下次启动时生效。</div>
-        </div>
-      </div>
-      <div class="row">
-        <div class="form-group">
-          <label>Admin Token</label>
-          <input type="password" id="adminToken" value="" onchange="markUnsaved()" placeholder="可选；留空表示不启用控制面鉴权">
-        </div>
-        <div class="form-group">
-          <label>说明</label>
-          <div class="tiny" style="padding-top:10px">启用后，<code>/api/config</code>、<code>/api/monitor</code>、<code>/api/config/test</code> 都需要浏览器携带控制面令牌。已保存的值会以脱敏形式显示。</div>
-        </div>
-      </div>
-    </div>
-
-    <div class="card">
-      <div class="provider-header">
-        <h2>Provider</h2>
-        <button class="btn btn-primary btn-sm" onclick="addProvider()">+ 添加 Provider</button>
-      </div>
-      <div id="providersList"></div>
+    <div class="status-tile">
+      <div class="label">累计请求</div>
+      <div class="value" id="totalRequestsDisplay">0</div>
     </div>
   </div>
-
-  <div class="stack">
-    <div class="card">
-      <div class="provider-header">
-        <div>
-          <h2>控制面访问</h2>
-          <div class="card-subtitle">如果启用了 admin token，在这里为当前浏览器会话设置访问令牌。</div>
+  <div class="layout">
+    <div class="stack">
+      <div class="card">
+        <div class="provider-header">
+          <div>
+            <h2>运行监控</h2>
+            <div class="card-subtitle">默认每 3 秒刷新一次，展示当前进程、线程池、请求计数和缓存压力。</div>
+          </div>
+          <div class="pill-row">
+            <span class="pill" id="refreshStamp">最近刷新: --</span>
+            <span class="pill" id="consoleModeBadge">控制台: --</span>
+          </div>
+        </div>
+        <div class="monitor-grid">
+          <div class="metric"><div class="label">运行时长</div><div class="value" id="uptimeDisplay">--</div><div class="meta" id="startedAtDisplay">启动时间 --</div></div>
+          <div class="metric"><div class="label">线程池</div><div class="value" id="threadPoolDisplay">--</div><div class="meta" id="threadPoolMeta">配置值 --</div></div>
+          <div class="metric"><div class="label">进程线程数</div><div class="value" id="threadCountDisplay">--</div><div class="meta" id="pidDisplay">PID --</div></div>
+          <div class="metric"><div class="label">缓冲区压力</div><div class="value" id="bufferDisplay">--</div><div class="meta" id="bufferMeta">队列空闲</div></div>
+          <div class="metric"><div class="label">流完成 / 取消</div><div class="value" id="streamOutcomeDisplay">0 / 0</div><div class="meta" id="streamOutcomeMeta">断连 0</div></div>
+          <div class="metric"><div class="label">错误请求</div><div class="value" id="errorDisplay">0</div><div class="meta" id="requestBreakdownDisplay">普通 0 · 流式 0</div></div>
+        </div>
+        <div class="pill-row" id="runtimeInfoRow">
+          <span class="pill">配置文件: --</span>
+          <span class="pill">日志文件: --</span>
         </div>
       </div>
-      <div class="row">
-        <div class="form-group">
-          <label>当前访问令牌</label>
-          <input type="password" id="accessTokenInput" placeholder="未设置时留空">
+      <div class="card">
+        <div class="provider-header">
+          <div>
+            <h2>活跃流</h2>
+            <div class="card-subtitle">显示当前正在向客户端输出 SSE 的请求和缓冲状态。</div>
+          </div>
         </div>
-        <div class="form-group">
-          <label>状态</label>
-          <div class="tiny" id="accessTokenState" style="padding-top:10px">未设置控制面访问令牌。</div>
-        </div>
+        <div id="streamsContainer" class="empty">当前没有活跃流。</div>
       </div>
-      <div class="inline-actions">
-        <button class="btn btn-primary btn-sm" onclick="applyAccessToken()">应用令牌</button>
-        <button class="btn btn-outline btn-sm" onclick="clearAccessToken()">清除令牌</button>
+      <div class="card">
+        <div class="provider-header">
+          <div>
+            <h2>会话概览</h2>
+            <div class="card-subtitle">按 Claude Code 会话维度聚合请求、活跃流、错误和 count_tokens 调用。</div>
+          </div>
+        </div>
+        <div id="sessionsContainer" class="empty">当前还没有会话级监控数据。</div>
       </div>
     </div>
-
-    <div class="card">
-      <div class="provider-header">
-        <div>
-          <h2>请求计数</h2>
-          <div class="card-subtitle">累计统计从当前进程启动时开始计算。</div>
+    <div class="stack">
+      <div class="card">
+        <div class="provider-header">
+          <div>
+            <h2>请求计数</h2>
+            <div class="card-subtitle">累计统计从当前进程启动时开始计算。</div>
+          </div>
+        </div>
+        <table class="table">
+          <thead><tr><th>指标</th><th>值</th><th>说明</th></tr></thead>
+          <tbody id="countersTableBody"></tbody>
+        </table>
+      </div>
+      <div class="card">
+        <h2>运行文件</h2>
+        <div class="tiny">
+          <div>配置文件: <code id="configPathDisplay">--</code></div>
+          <div style="margin-top:8px">日志文件: <code id="logPathDisplay">--</code></div>
+          <div style="margin-top:8px">Web UI: <code id="webuiDisplay">--</code></div>
         </div>
       </div>
-      <table class="table">
-        <thead>
-          <tr><th>指标</th><th>值</th><th>说明</th></tr>
-        </thead>
-        <tbody id="countersTableBody"></tbody>
-      </table>
     </div>
+  </div>
+</section>
 
+<section id="providersTab" class="tab-panel" role="tabpanel" aria-labelledby="providersTabButton">
+  <div class="layout">
+    <div class="stack">
+      <div class="card">
+        <h2>通用设置</h2>
+        <div class="row">
+          <div class="form-group"><label>监听端口</label><input type="number" id="port" value="8080" min="1024" max="65535" onchange="markUnsaved()"></div>
+          <div class="form-group"><label>绑定地址</label><input type="text" id="bind" value="127.0.0.1" onchange="markUnsaved()"></div>
+        </div>
+        <div class="row">
+          <div class="form-group"><label>线程池大小</label><input type="number" id="threadPoolSize" value="8" min="0" onchange="markUnsaved()"></div>
+          <div class="form-group"><label>说明</label><div class="tiny" style="padding-top:10px">`0` 表示不设上限，网关会按需动态扩容；大于 `0` 时按固定工作线程启动。这个值在下次启动时生效。</div></div>
+        </div>
+        <div class="row">
+          <div class="form-group"><label>Admin Token</label><input type="password" id="adminToken" value="" onchange="markUnsaved()" placeholder="可选；留空表示不启用控制面鉴权"></div>
+          <div class="form-group"><label>说明</label><div class="tiny" style="padding-top:10px">启用后，<code>/api/config</code>、<code>/api/monitor</code>、<code>/api/config/test</code> 都需要浏览器携带控制面令牌。已保存的值会以脱敏形式显示。</div></div>
+        </div>
+      </div>
+      <div class="card">
+        <div class="provider-header">
+          <h2>Provider</h2>
+          <button class="btn btn-primary btn-sm" onclick="addProvider()">+ 添加 Provider</button>
+        </div>
+        <div id="providersList"></div>
+      </div>
+    </div>
+    <div class="stack">
+      <div class="card">
+        <div class="provider-header">
+          <div>
+            <h2>控制面访问</h2>
+            <div class="card-subtitle">如果启用了 admin token，在这里为当前浏览器会话设置访问令牌。</div>
+          </div>
+        </div>
+        <div class="row">
+          <div class="form-group"><label>当前访问令牌</label><input type="password" id="accessTokenInput" placeholder="未设置时留空"></div>
+          <div class="form-group"><label>状态</label><div class="tiny" id="accessTokenState" style="padding-top:10px">未设置控制面访问令牌。</div></div>
+        </div>
+        <div class="inline-actions">
+          <button class="btn btn-primary btn-sm" onclick="applyAccessToken()">应用令牌</button>
+          <button class="btn btn-outline btn-sm" onclick="clearAccessToken()">清除令牌</button>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="routesTab" class="tab-panel" role="tabpanel" aria-labelledby="routesTabButton">
+  <div class="single-column">
     <div class="card">
       <div class="provider-header">
         <h2>模型路由</h2>
@@ -292,7 +271,6 @@ body{font-family:'Segoe UI',Tahoma,sans-serif;background:radial-gradient(circle 
       <div class="card-subtitle">可为每个网关模型声明 capabilities，并设置请求覆盖项，例如 thinking 和 effort。</div>
       <div id="modelsList"></div>
     </div>
-
     <div class="card">
       <div class="provider-header">
         <h2>模型别名</h2>
@@ -302,26 +280,15 @@ body{font-family:'Segoe UI',Tahoma,sans-serif;background:radial-gradient(circle 
         <div class="row">
           <div class="form-group"><label>别名</label><input type="text" id="newAliasKey" placeholder="如: sonnet"></div>
           <div class="form-group"><label>Provider</label><select id="newAliasProviderId"></select></div>
-          <div class="form-group"><label>上游模型</label>
-            <select id="newAliasModel"><option value="">-- 选择模型 --</option></select>
-          </div>
+          <div class="form-group"><label>上游模型</label><select id="newAliasModel"><option value="">-- 选择模型 --</option></select></div>
         </div>
         <button class="btn btn-success btn-sm" onclick="addAlias()">确认</button>
         <button class="btn btn-outline btn-sm" onclick="document.getElementById('addAliasForm').style.display='none'">取消</button>
       </div>
       <div id="aliasesList" class="aliases-list"></div>
     </div>
-
-    <div class="card">
-      <h2>运行文件</h2>
-      <div class="tiny">
-        <div>配置文件: <code id="configPathDisplay">--</code></div>
-        <div style="margin-top:8px">日志文件: <code id="logPathDisplay">--</code></div>
-        <div style="margin-top:8px">Web UI: <code id="webuiDisplay">--</code></div>
-      </div>
-    </div>
   </div>
-</div>
+</section>
 
 <div class="save-bar">
   <span id="saveStatus" style="color:#66758a;font-size:13px">当前页面会持续刷新运行态，配置需要点击保存后才会写入磁盘。</span>
@@ -436,6 +403,20 @@ function handleAuthFailure(source) {
   setMonitorDisconnected('控制面需要有效令牌');
 }
 
+function showTab(tabName) {
+  const tabs = ['dashboard', 'providers', 'routes'];
+  tabs.forEach(name => {
+    const active = name === tabName;
+    const panel = document.getElementById(`${name}Tab`);
+    const button = document.getElementById(`${name}TabButton`);
+    if (panel) panel.classList.toggle('active', active);
+    if (button) {
+      button.classList.toggle('active', active);
+      button.setAttribute('aria-selected', active ? 'true' : 'false');
+    }
+  });
+}
+
 function ensureConfigShape() {
   config.admin_token = String(config.admin_token || '');
   config.providers = Array.isArray(config.providers) ? config.providers : [];
@@ -485,7 +466,96 @@ function allocateModelId(providerId, upstreamModel, models) {
   return candidate;
 }
 
+function readControlValue(container, selector, fallback = '') {
+  const el = container.querySelector(selector);
+  return el ? el.value : fallback;
+}
+
+function syncCurrentFormStateFromDom() {
+  const providerIdRemap = {};
+  const providerRows = Array.from(document.querySelectorAll('#providersList .provider-item'));
+  if (providerRows.length) {
+    config.providers = providerRows.map((row, index) => {
+      const existing = config.providers[index] || {};
+      const id = String(readControlValue(row, '[data-provider-field="id"]', existing.id || '')).trim();
+      if (existing.id && id && existing.id !== id) {
+        providerIdRemap[existing.id] = id;
+      }
+      return {
+        id,
+        type: readControlValue(row, '[data-provider-field="type"]', existing.type || 'openai') || 'openai',
+        name: String(readControlValue(row, '[data-provider-field="name"]', existing.name || '')).trim(),
+        api_key: String(readControlValue(row, '[data-provider-field="api_key"]', existing.api_key || '')),
+        base_url: String(readControlValue(row, '[data-provider-field="base_url"]', existing.base_url || '')).trim(),
+        models: readControlValue(row, '[data-provider-field="models"]', Array.isArray(existing.models) ? existing.models.join(', ') : '')
+          .split(',')
+          .map(s => s.trim())
+          .filter(Boolean)
+      };
+    }).filter(p => p.id);
+  }
+
+  const modelRows = Array.from(document.querySelectorAll('#modelsList .provider-item'));
+  if (modelRows.length) {
+    const nextModels = {};
+    const modelIdRemap = {};
+    for (const row of modelRows) {
+      const oldModelId = row.dataset.modelId || '';
+      const nextModelId = String(readControlValue(row, '[data-model-field="id"]', oldModelId)).trim();
+      if (!nextModelId) {
+        throw new Error('模型 ID 不能为空');
+      }
+      if (nextModels[nextModelId]) {
+        throw new Error('模型 ID 重复: ' + nextModelId);
+      }
+      const existing = normalizeModel(config.models[oldModelId], nextModelId);
+      let provider = readControlValue(row, '[data-model-field="provider"]', existing.provider);
+      provider = providerIdRemap[provider] || provider;
+      const capabilities = {};
+      row.querySelectorAll('[data-model-capability]').forEach(input => {
+        capabilities[input.dataset.modelCapability] = Boolean(input.checked);
+      });
+      const thinking = readControlValue(row, '[data-model-field="thinking"]', existing.thinking);
+      const effort = readControlValue(row, '[data-model-field="effort"]', existing.effort);
+      nextModels[nextModelId] = normalizeModel({
+        id: nextModelId,
+        provider,
+        upstream_model: String(readControlValue(row, '[data-model-field="upstream_model"]', existing.upstream_model)).trim(),
+        protocol: readControlValue(row, '[data-model-field="protocol"]', existing.protocol),
+        role: readControlValue(row, '[data-model-field="role"]', existing.role),
+        thinking,
+        effort,
+        capabilities,
+        request_overrides: {
+          ...(thinking ? {thinking: {type: thinking}} : {}),
+          ...(effort ? {effort} : {})
+        }
+      }, nextModelId);
+      if (oldModelId && oldModelId !== nextModelId) {
+        modelIdRemap[oldModelId] = nextModelId;
+      }
+    }
+    config.models = nextModels;
+    const nextAliases = {};
+    for (const [alias, modelId] of Object.entries(config.aliases || {})) {
+      const nextModelId = modelIdRemap[modelId] || modelId;
+      if (config.models[nextModelId]) {
+        nextAliases[alias] = nextModelId;
+      }
+    }
+    config.aliases = nextAliases;
+    config.model_aliases = {};
+    for (const [alias, modelId] of Object.entries(config.aliases)) {
+      const model = config.models[modelId];
+      if (model && model.provider && model.upstream_model) {
+        config.model_aliases[alias] = `${model.provider}:${model.upstream_model}`;
+      }
+    }
+  }
+}
+
 function buildCanonicalPayload() {
+  syncCurrentFormStateFromDom();
   const port = parseInt(document.getElementById('port').value, 10) || 8080;
   const bind = document.getElementById('bind').value || '127.0.0.1';
   const adminToken = document.getElementById('adminToken').value || '';
@@ -521,6 +591,11 @@ function buildCanonicalPayload() {
 
   const aliases = {};
   const modelAliases = {};
+  for (const [alias, modelId] of Object.entries(config.aliases || {})) {
+    if (!alias || !modelId || !models[modelId]) continue;
+    aliases[alias] = modelId;
+    modelAliases[alias] = `${models[modelId].provider}:${models[modelId].upstream_model}`;
+  }
   for (const [alias, target] of Object.entries(config.model_aliases || {})) {
     const [providerId, upstreamModel] = String(target || '').split(':');
     if (!alias || !providerId || !upstreamModel) continue;
@@ -615,35 +690,35 @@ function renderModelRoutes() {
     const model = normalizeModel(rawModel, modelId);
     const aliasRefs = countAliasReferencesForModel(modelId);
     return `
-      <div class="provider-item">
+      <div class="provider-item" data-model-id="${esc(modelId)}">
         <div class="row">
-          <div class="form-group"><label>模型 ID</label><input value="${esc(modelId)}" onchange="renameModelRoute(${jsq(modelId)}, this.value)"></div>
-          <div class="form-group"><label>Provider</label><select onchange="updateModelField(${jsq(modelId)}, 'provider', this.value)">${providerOptionsHtml(model.provider)}</select></div>
-          <div class="form-group"><label>上游模型</label><input value="${esc(model.upstream_model)}" onchange="updateModelField(${jsq(modelId)}, 'upstream_model', this.value)"></div>
+          <div class="form-group"><label>模型 ID</label><input data-model-field="id" value="${esc(modelId)}" onchange="renameModelRoute(${jsq(modelId)}, this.value)"></div>
+          <div class="form-group"><label>Provider</label><select data-model-field="provider" onchange="updateModelField(${jsq(modelId)}, 'provider', this.value)">${providerOptionsHtml(model.provider)}</select></div>
+          <div class="form-group"><label>上游模型</label><input data-model-field="upstream_model" value="${esc(model.upstream_model)}" onchange="updateModelField(${jsq(modelId)}, 'upstream_model', this.value)"></div>
         </div>
         <div class="row">
-          <div class="form-group"><label>协议</label><select onchange="updateModelField(${jsq(modelId)}, 'protocol', this.value)">
+          <div class="form-group"><label>协议</label><select data-model-field="protocol" onchange="updateModelField(${jsq(modelId)}, 'protocol', this.value)">
             <option value="" ${!model.protocol ? 'selected' : ''}>自动</option>
             <option value="anthropic" ${model.protocol === 'anthropic' ? 'selected' : ''}>Anthropic</option>
             <option value="openai" ${model.protocol === 'openai' ? 'selected' : ''}>OpenAI</option>
           </select></div>
-          <div class="form-group"><label>角色</label><input value="${esc(model.role || '')}" onchange="updateModelField(${jsq(modelId)}, 'role', this.value)" placeholder="可选"></div>
+          <div class="form-group"><label>角色</label><input data-model-field="role" value="${esc(model.role || '')}" onchange="updateModelField(${jsq(modelId)}, 'role', this.value)" placeholder="可选"></div>
           <div class="form-group"><label>别名引用</label><div class="tiny" style="padding-top:10px">当前有 ${formatNumber(aliasRefs)} 个别名指向该路由。</div></div>
         </div>
         <div class="row">
-          <div class="form-group"><label>Thinking Override</label><select onchange="updateModelThinking(${jsq(modelId)}, this.value)">
+          <div class="form-group"><label>Thinking Override</label><select data-model-field="thinking" onchange="updateModelThinking(${jsq(modelId)}, this.value)">
             <option value="" ${!model.thinking ? 'selected' : ''}>继承请求</option>
             <option value="enabled" ${model.thinking === 'enabled' ? 'selected' : ''}>enabled</option>
             <option value="disabled" ${model.thinking === 'disabled' ? 'selected' : ''}>disabled</option>
           </select></div>
-          <div class="form-group"><label>Effort Override</label><input value="${esc(model.effort || '')}" onchange="updateModelEffort(${jsq(modelId)}, this.value)" placeholder="如: low / medium / high"></div>
+          <div class="form-group"><label>Effort Override</label><input data-model-field="effort" value="${esc(model.effort || '')}" onchange="updateModelEffort(${jsq(modelId)}, this.value)" placeholder="如: low / medium / high"></div>
         </div>
         <div class="form-group">
           <label>Capabilities</label>
           <div class="checkbox-grid">
             ${Object.entries(capabilityLabels).map(([key, label]) => `
               <label class="checkbox-item">
-                <input type="checkbox" ${model.capabilities[key] ? 'checked' : ''} onchange="updateModelCapability(${jsq(modelId)}, ${jsq(key)}, this.checked)">
+                <input type="checkbox" data-model-capability="${esc(key)}" ${model.capabilities[key] ? 'checked' : ''} onchange="updateModelCapability(${jsq(modelId)}, ${jsq(key)}, this.checked)">
                 <span>${esc(label)}</span>
               </label>
             `).join('')}
@@ -674,22 +749,23 @@ function render() {
   config.providers.forEach((p, i) => {
     const div = document.createElement('div');
     div.className = 'provider-item';
+    div.dataset.providerIndex = String(i);
     div.innerHTML = `
       <div class="row">
-        <div class="form-group"><label>ID</label><input value="${esc(p.id)}" onchange="updateProvider(${i},'id',this.value)"></div>
-        <div class="form-group"><label>名称</label><input value="${esc(p.name)}" onchange="updateProvider(${i},'name',this.value)"></div>
-        <div class="form-group"><label>类型</label><select onchange="updateProvider(${i},'type',this.value)">
+        <div class="form-group"><label>ID</label><input data-provider-field="id" value="${esc(p.id)}" onchange="updateProvider(${i},'id',this.value)"></div>
+        <div class="form-group"><label>名称</label><input data-provider-field="name" value="${esc(p.name)}" onchange="updateProvider(${i},'name',this.value)"></div>
+        <div class="form-group"><label>类型</label><select data-provider-field="type" onchange="updateProvider(${i},'type',this.value)">
           <option value="anthropic" ${p.type==='anthropic'?'selected':''}>Anthropic</option>
           <option value="openai" ${p.type==='openai'?'selected':''}>OpenAI</option>
         </select></div>
       </div>
       <div class="row">
-        <div class="form-group"><label>API Key</label><input type="password" value="${esc(p.api_key||'')}" onchange="updateProvider(${i},'api_key',this.value)" placeholder="sk-..."></div>
-        <div class="form-group"><label>Base URL</label><input value="${esc(p.base_url)}" onchange="updateProvider(${i},'base_url',this.value)"></div>
+        <div class="form-group"><label>API Key</label><input data-provider-field="api_key" type="password" value="${esc(p.api_key||'')}" onchange="updateProvider(${i},'api_key',this.value)" placeholder="sk-..."></div>
+        <div class="form-group"><label>Base URL</label><input data-provider-field="base_url" value="${esc(p.base_url)}" onchange="updateProvider(${i},'base_url',this.value)"></div>
       </div>
       <div class="form-group">
         <label>模型列表 (逗号分隔)</label>
-        <input value="${esc((p.models||[]).join(', '))}" onchange="updateProviderModels(${i},this.value)">
+        <input data-provider-field="models" value="${esc((p.models||[]).join(', '))}" onchange="updateProviderModels(${i},this.value)">
         <div class="models-tags">${(p.models||[]).map(m => `<span class="model-tag">${esc(m)}</span>`).join('')}</div>
       </div>
       <div class="provider-actions">
@@ -952,6 +1028,23 @@ function addAlias() {
   const model = document.getElementById('newAliasModel').value;
   if (!key || !model) { toast('请填写别名和选择模型', 'error'); return; }
   config.model_aliases[key] = pid + ':' + model;
+  let modelId = findModelIdForTarget(config.model_aliases[key]);
+  if (!modelId) {
+    modelId = allocateModelId(pid, model, config.models || {});
+    const provider = config.providers.find(p => p.id === pid);
+    config.models[modelId] = normalizeModel({
+      id: modelId,
+      provider: pid,
+      upstream_model: model,
+      protocol: provider && provider.type ? provider.type : '',
+      role: '',
+      thinking: '',
+      effort: '',
+      capabilities: {},
+      request_overrides: {}
+    }, modelId);
+  }
+  config.aliases[key] = modelId;
   document.getElementById('addAliasForm').style.display = 'none';
   markUnsaved();
   render();
@@ -959,6 +1052,7 @@ function addAlias() {
 
 function removeAlias(key) {
   delete config.model_aliases[key];
+  delete config.aliases[key];
   markUnsaved();
   render();
 }
@@ -1141,11 +1235,10 @@ async function testProvider(providerId) {
 }
 
 async function saveConfig() {
-  const payload = buildCanonicalPayload();
-
   const btn = document.querySelector('.save-bar .btn-success');
   btn.disabled = true; btn.textContent = '保存中...';
   try {
+    const payload = buildCanonicalPayload();
     const r = await gatewayFetch('/api/config', {
       method:'POST',
       headers:{'Content-Type':'application/json'},

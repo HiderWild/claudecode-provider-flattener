@@ -243,19 +243,38 @@ struct Config {
                 }
             }
 
-            if (cfg.models.empty() && j.contains("model_aliases") && j["model_aliases"].is_object()) {
+            if (j.contains("model_aliases") && j["model_aliases"].is_object()) {
                 for (auto& [k, v] : j["model_aliases"].items()) {
+                    if (cfg.aliases.find(k) != cfg.aliases.end()) continue;
                     if (!v.is_string()) continue;
                     const std::string target = v.get<std::string>();
                     auto colon = target.find(':');
                     if (colon == std::string::npos) continue;
 
-                    ModelConfig model;
-                    model.id = k;
-                    model.provider = target.substr(0, colon);
-                    model.upstream_model = target.substr(colon + 1);
-                    cfg.models[model.id] = model;
-                    cfg.aliases[k] = model.id;
+                    const std::string provider = target.substr(0, colon);
+                    const std::string upstream_model = target.substr(colon + 1);
+                    std::string model_id;
+                    for (const auto& [candidate_id, model] : cfg.models) {
+                        if (model.provider == provider && model.upstream_model == upstream_model) {
+                            model_id = candidate_id;
+                            break;
+                        }
+                    }
+                    if (model_id.empty()) {
+                        model_id = k;
+                        if (cfg.models.find(model_id) != cfg.models.end()) {
+                            int seq = 2;
+                            do {
+                                model_id = k + "-" + std::to_string(seq++);
+                            } while (cfg.models.find(model_id) != cfg.models.end());
+                        }
+                        ModelConfig model;
+                        model.id = model_id;
+                        model.provider = provider;
+                        model.upstream_model = upstream_model;
+                        cfg.models[model.id] = model;
+                    }
+                    cfg.aliases[k] = model_id;
                 }
             }
 
