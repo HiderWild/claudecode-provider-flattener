@@ -23,11 +23,21 @@ This gateway flattens those differences into one local Anthropic-compatible surf
 - `/v1/messages/count_tokens` support with upstream passthrough and local fallback estimation
 - Per-session monitoring keyed by `X-Claude-Code-Session-Id`
 - Local control panel for providers, model routes, aliases, capabilities, request overrides, and runtime telemetry
-- Background launch by default, foreground mode with `--show`, and restart supervision with `--daemon`
+- Single-instance runtime with in-process worker threads on macOS and Windows
 
 ## Quick start
 
 ### 1. Build
+
+macOS:
+
+```bash
+cmake -B build-macos -S .
+cmake --build build-macos --clean-first -j"$(sysctl -n hw.ncpu)"
+install -m 755 build-macos/model-gateway ~/.claude/model-gateway/bin/model-gateway
+```
+
+Windows (MinGW):
 
 ```powershell
 cmake -B build -S . -G "MinGW Makefiles"
@@ -42,28 +52,65 @@ Or use the helper script:
 
 ### 2. Run the gateway
 
+macOS and Windows now run as single foreground processes. If you want background supervision, use an external supervisor.
+
+macOS:
+
+```bash
+./build-macos/model-gateway
+```
+
+Detached macOS example:
+
+```bash
+nohup ./build-macos/model-gateway >/tmp/model-gateway.log 2>&1 &
+```
+
+Verbose startup example:
+
+```bash
+./build-macos/model-gateway --show
+```
+
+Install a per-user `launchd` agent on macOS:
+
+```bash
+bash darwin/install-launchd.sh install
+```
+
+Check `launchd` status:
+
+```bash
+bash darwin/install-launchd.sh status
+```
+
+Windows:
+
 ```powershell
 ./build/model-gateway.exe
 ```
 
-Useful modes:
+Windows foreground helper:
 
-- default: starts in the background and returns to the shell
-- `--show`: keep the gateway attached to the current console
-- `--daemon`: run a supervisor that restarts the worker after unexpected exits
+```powershell
+./start.bat
+```
 
-Examples:
+Windows startup options:
 
 ```powershell
 ./build/model-gateway.exe --show
-./build/model-gateway.exe --daemon
 ./build/model-gateway.exe --show 9457
 ```
+
+For background restart supervision on Windows, use Task Scheduler, NSSM, or another external service manager.
 
 The installed runtime uses the user-scoped Claude directory:
 
 - binary: `~/.claude/model-gateway/bin`
 - config: `~/.claude/model-gateway/config.json`
+
+On macOS and Windows, a second gateway instance now fails fast instead of sharing the same port or process role. Concurrency stays inside one process via the configured thread pool.
 
 ### 3. Point Claude Code at the gateway
 

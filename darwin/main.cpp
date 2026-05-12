@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cctype>
+#include <filesystem>
 #include <fstream>
 #include <iomanip>
 #include <map>
@@ -10,9 +11,11 @@
 #include <thread>
 #include <chrono>
 #include <httplib.h>
+#include <fcntl.h>
+#include <pthread.h>
 #include <unistd.h>
+#include <sys/file.h>
 #include <sys/types.h>
-#include <sys/wait.h>
 #include <sys/sysctl.h>
 #include <mach-o/dyld.h>
 #include <signal.h>
@@ -43,6 +46,9 @@ static std::mutex g_config_mutex;
 static int g_effective_thread_pool_size = ServerThreadPool::kDefaultThreadCount;
 static std::mutex g_runtime_log_mutex;
 static bool g_console_visible = false;
+static int g_instance_lock_fd = -1;
+static std::string g_instance_lock_path;
+static volatile sig_atomic_t g_shutdown_signal = 0;
 
 struct MonitorCounters {
     std::atomic<uint64_t> total_requests{0};
@@ -92,9 +98,6 @@ static const auto g_monitor_started_steady = std::chrono::steady_clock::now();
 
 struct StartupOptions {
     bool show_console = false;
-    bool daemon = false;
-    bool internal_run = false;
-    bool internal_daemon = false;
     bool show_help = false;
     bool has_port_override = false;
     int port_override = 0;
@@ -124,6 +127,10 @@ static std::string get_runtime_log_path() {
     return get_runtime_directory() + "/model-gateway.log";
 }
 
+static std::string get_instance_lock_path() {
+    return Config::getConfigDir() + "/model-gateway.lock";
+}
+
 static std::string get_home_directory() {
     const char* home = getenv("HOME");
     if (!home) home = getenv("USERPROFILE");
@@ -149,6 +156,118 @@ static std::string redact_local_path(const std::string& path) {
     }
 
     return normalized_path;
+}
+
+static std::string read_lock_holder_pid(int fd) {
+    if (lseek(fd, 0, SEEK_SET) < 0) {
+        return "";
+    }
+
+    char buffer[64];
+    const ssize_t bytes_read = read(fd, buffer, sizeof(buffer) - 1);
+    if (bytes_read <= 0) {
+        return "";
+    }
+
+    buffer[bytes_read] = '\0';
+    std::string pid_text(buffer);
+    pid_text.erase(std::remove_if(pid_text.begin(), pid_text.end(), [](unsigned char ch) {
+        return std::isspace(ch) != 0;
+    }), pid_text.end());
+    return pid_text;
+}
+
+static bool acquire_instance_lock(std::string& error_message) {
+    try {
+        std::filesystem::create_directories(Config::getConfigDir());
+    } catch (const std::exception& e) {
+        error_message = "failed to prepare runtime directory: " + std::string(e.what());
+        return false;
+    }
+
+    const std::string lock_path = get_instance_lock_path();
+    const int fd = open(lock_path.c_str(), O_CREAT | O_RDWR, 0644);
+    if (fd < 0) {
+        error_message = "failed to open lock file " + redact_local_path(lock_path) + ": " +
+            std::string(strerror(errno));
+        return false;
+    }
+
+    if (flock(fd, LOCK_EX | LOCK_NB) != 0) {
+        const int lock_errno = errno;
+        const std::string existing_pid = read_lock_holder_pid(fd);
+        close(fd);
+
+        if (lock_errno == EWOULDBLOCK) {
+            error_message = existing_pid.empty()
+                ? "another gateway instance is already running"
+                : "another gateway instance is already running with pid=" + existing_pid;
+        } else {
+            error_message = "failed to lock " + redact_local_path(lock_path) + ": " +
+                std::string(strerror(lock_errno));
+        }
+        return false;
+    }
+
+    if (ftruncate(fd, 0) != 0) {
+        error_message = "failed to truncate lock file " + redact_local_path(lock_path) + ": " +
+            std::string(strerror(errno));
+        flock(fd, LOCK_UN);
+        close(fd);
+        return false;
+    }
+
+    const std::string pid_text = std::to_string(getpid()) + "\n";
+    if (lseek(fd, 0, SEEK_SET) < 0 ||
+        write(fd, pid_text.c_str(), pid_text.size()) != static_cast<ssize_t>(pid_text.size())) {
+        error_message = "failed to write lock file " + redact_local_path(lock_path) + ": " +
+            std::string(strerror(errno));
+        flock(fd, LOCK_UN);
+        close(fd);
+        unlink(lock_path.c_str());
+        return false;
+    }
+
+    g_instance_lock_fd = fd;
+    g_instance_lock_path = lock_path;
+    return true;
+}
+
+static void release_instance_lock() {
+    if (g_instance_lock_fd >= 0) {
+        flock(g_instance_lock_fd, LOCK_UN);
+        close(g_instance_lock_fd);
+        g_instance_lock_fd = -1;
+    }
+
+    if (!g_instance_lock_path.empty()) {
+        unlink(g_instance_lock_path.c_str());
+        g_instance_lock_path.clear();
+    }
+}
+
+static bool install_signal_waiter(sigset_t& signal_set,
+                                  httplib::Server& svr,
+                                  std::string& error_message) {
+    sigemptyset(&signal_set);
+    sigaddset(&signal_set, SIGINT);
+    sigaddset(&signal_set, SIGTERM);
+
+    const int mask_result = pthread_sigmask(SIG_BLOCK, &signal_set, nullptr);
+    if (mask_result != 0) {
+        error_message = "failed to block shutdown signals: " + std::string(strerror(mask_result));
+        return false;
+    }
+
+    std::thread([signal_set, &svr]() mutable {
+        int signum = 0;
+        if (sigwait(&signal_set, &signum) == 0) {
+            g_shutdown_signal = signum;
+            svr.stop();
+        }
+    }).detach();
+
+    return true;
 }
 
 static GatewayRequestContext extract_request_context(const httplib::Request& req) {
@@ -334,9 +453,8 @@ static void log_debug(const std::string& message, bool show_console) {
 }
 
 static void print_usage() {
-    std::cout << "Usage: model-gateway [--show] [--daemon] [port]" << std::endl;
-    std::cout << "  --show    Run in the current console instead of detaching to background." << std::endl;
-    std::cout << "  --daemon  Launch a supervisor that restarts the worker if it exits." << std::endl;
+    std::cout << "Usage: model-gateway [--show] [port]" << std::endl;
+    std::cout << "  --show    Print startup details in the current console." << std::endl;
     std::cout << "  port      Optional port override for this launch." << std::endl;
 }
 
@@ -610,17 +728,12 @@ static bool parse_startup_options(int argc, char* argv[], StartupOptions& option
             continue;
         }
         if (arg == "--daemon") {
-            options.daemon = true;
-            continue;
+            error_message = "--daemon is no longer supported on darwin; use launchd, tmux, or nohup for supervision.";
+            return false;
         }
-        if (arg == "--internal-run") {
-            options.internal_run = true;
-            continue;
-        }
-        if (arg == "--internal-daemon") {
-            options.internal_daemon = true;
-            options.daemon = true;
-            continue;
+        if (arg == "--internal-run" || arg == "--internal-daemon") {
+            error_message = "Internal daemon modes are no longer supported on darwin.";
+            return false;
         }
         if (arg == "--help" || arg == "-h") {
             options.show_help = true;
@@ -641,115 +754,7 @@ static bool parse_startup_options(int argc, char* argv[], StartupOptions& option
         options.has_port_override = true;
     }
 
-    if (options.internal_run && options.internal_daemon) {
-        error_message = "Internal run modes cannot be combined.";
-        return false;
-    }
-
     return true;
-}
-
-// ─── Process spawning (POSIX) ──────────────────────────────────────────────
-
-static pid_t spawn_gateway_process(const std::string& mode_flag,
-                                    const StartupOptions& options,
-                                    bool detached,
-                                    std::string& error_message) {
-    const std::string exe_path = get_executable_path();
-    if (exe_path.empty()) {
-        error_message = "Failed to get executable path.";
-        return -1;
-    }
-
-    std::vector<std::string> args;
-    args.push_back(exe_path);
-    args.push_back(mode_flag);
-    if (options.has_port_override) {
-        args.push_back(std::to_string(options.port_override));
-    }
-
-    pid_t pid = fork();
-    if (pid < 0) {
-        error_message = "fork() failed: " + std::string(strerror(errno));
-        return -1;
-    }
-
-    if (pid == 0) {
-        // Child process
-        if (detached) {
-            setsid();
-        }
-
-        std::vector<char*> argv;
-        for (auto& arg : args) {
-            argv.push_back(const_cast<char*>(arg.c_str()));
-        }
-        argv.push_back(nullptr);
-
-        execv(exe_path.c_str(), argv.data());
-
-        // If execv returns, it failed
-        _exit(1);
-    }
-
-    return pid;
-}
-
-static int launch_detached_mode(const StartupOptions& options) {
-    std::string error_message;
-    const bool daemon_mode = options.daemon && !options.internal_run;
-
-    pid_t pid = spawn_gateway_process(daemon_mode ? "--internal-daemon" : "--internal-run",
-                                       options, true, error_message);
-    if (pid < 0) {
-        log_error("[launcher] failed to start detached process: " + error_message, true);
-        return 1;
-    }
-
-    const std::string mode_name = daemon_mode ? "daemon" : "worker";
-    append_runtime_log("INFO", "[launcher] started background " + mode_name +
-        " pid=" + std::to_string(pid));
-    std::cout << "[launcher] started background " << mode_name
-              << " pid=" << pid << std::endl;
-
-    return 0;
-}
-
-static int run_daemon_supervisor(const StartupOptions& options) {
-    const bool show_console = options.show_console;
-    log_info("[daemon] supervisor started", show_console);
-
-    while (true) {
-        std::string error_message;
-        pid_t worker_pid = spawn_gateway_process("--internal-run",
-                                                   options, true, error_message);
-        if (worker_pid < 0) {
-            log_error("[daemon] failed to launch worker: " + error_message, show_console);
-            std::this_thread::sleep_for(std::chrono::seconds(2));
-            continue;
-        }
-
-        log_info("[daemon] worker started pid=" + std::to_string(worker_pid), show_console);
-
-        const auto started_at = std::chrono::steady_clock::now();
-        int status = 0;
-        waitpid(worker_pid, &status, 0);
-
-        int exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : 1;
-
-        const auto runtime = std::chrono::duration_cast<std::chrono::seconds>(
-            std::chrono::steady_clock::now() - started_at).count();
-        const bool failed_fast = runtime < 5;
-        const auto restart_delay = failed_fast ? std::chrono::seconds(2)
-                                               : std::chrono::milliseconds(800);
-
-        log_warn("[daemon] worker exited code=" + std::to_string(exit_code) +
-                 ", uptime=" + std::to_string(runtime) +
-                 "s, restart in " +
-                 std::to_string(std::chrono::duration_cast<std::chrono::milliseconds>(restart_delay).count()) +
-                 "ms", show_console);
-        std::this_thread::sleep_for(restart_delay);
-    }
 }
 
 static int run_gateway_server(const StartupOptions& options) {
@@ -764,6 +769,19 @@ static int run_gateway_server(const StartupOptions& options) {
         std::cout << std::endl;
     }
 
+    g_shutdown_signal = 0;
+    std::string lock_error;
+    if (!acquire_instance_lock(lock_error)) {
+        log_error("[gateway] " + lock_error, true);
+        return 1;
+    }
+
+    struct InstanceLockGuard {
+        ~InstanceLockGuard() {
+            release_instance_lock();
+        }
+    } instance_lock_guard;
+
     g_config = Config::load();
     if (options.has_port_override) {
         g_config.port = options.port_override;
@@ -775,6 +793,12 @@ static int run_gateway_server(const StartupOptions& options) {
              std::to_string(g_config.models.size()) + " model(s)", show_console);
 
     httplib::Server svr;
+    svr.set_socket_options([](socket_t sock) {
+        httplib::set_socket_opt(sock, SOL_SOCKET, SO_REUSEADDR, 1);
+#ifdef SO_REUSEPORT
+        httplib::set_socket_opt(sock, SOL_SOCKET, SO_REUSEPORT, 0);
+#endif
+    });
     const int thread_pool_size = g_config.thread_pool_size;
     g_effective_thread_pool_size = thread_pool_size;
     svr.new_task_queue = [thread_pool_size]() {
@@ -827,10 +851,28 @@ static int run_gateway_server(const StartupOptions& options) {
         std::cout << std::endl;
     }
 
-    if (!svr.listen(addr, port)) {
-        log_error("[gateway] failed to start on " + addr + ":" + std::to_string(port),
-                  show_console);
+    sigset_t signal_set;
+    std::string signal_error;
+    if (!install_signal_waiter(signal_set, svr, signal_error)) {
+        log_error("[gateway] " + signal_error, true);
         return 1;
+    }
+
+    const bool listen_ok = svr.listen(addr, port);
+
+    if (!listen_ok) {
+        if (g_shutdown_signal != 0) {
+            log_info("[gateway] shutdown requested", show_console);
+            return 0;
+        }
+        log_error("[gateway] failed to start on " + addr + ":" + std::to_string(port),
+                  true);
+        return 1;
+    }
+
+    if (g_shutdown_signal != 0) {
+        log_info("[gateway] shutdown requested", show_console);
+        return 0;
     }
 
     log_warn("[gateway] server stopped", show_console);
@@ -1591,21 +1633,6 @@ int main(int argc, char* argv[]) {
     if (options.show_help) {
         print_usage();
         return 0;
-    }
-
-    if (options.internal_daemon) {
-        return run_daemon_supervisor(options);
-    }
-
-    if (options.daemon) {
-        if (options.show_console) {
-            return run_daemon_supervisor(options);
-        }
-        return launch_detached_mode(options);
-    }
-
-    if (!options.show_console && !options.internal_run) {
-        return launch_detached_mode(options);
     }
 
     return run_gateway_server(options);

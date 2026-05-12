@@ -621,13 +621,14 @@ std::string OpenAIProvider::transformRequest(const json& anthropic_req,
         oai["messages"].push_back(sys_msg);
     }
 
-    // Copy messages (translate Anthropic content blocks → OpenAI content strings)
+    // Copy messages (translate Anthropic content blocks → OpenAI messages)
     if (anthropic_req.contains("messages") && anthropic_req["messages"].is_array()) {
         for (const auto& msg : anthropic_req["messages"]) {
-            json oai_msg;
-            oai_msg["role"] = msg.value("role", "user");
+            const std::string role = msg.value("role", "user");
 
             if (!msg.contains("content")) {
+                json oai_msg;
+                oai_msg["role"] = role;
                 oai_msg["content"] = "";
                 oai["messages"].push_back(oai_msg);
                 continue;
@@ -636,22 +637,127 @@ std::string OpenAIProvider::transformRequest(const json& anthropic_req,
             const auto& content = msg["content"];
 
             if (content.is_string()) {
+                json oai_msg;
+                oai_msg["role"] = role;
                 oai_msg["content"] = content;
-            } else if (content.is_array()) {
+                oai["messages"].push_back(oai_msg);
+                continue;
+            }
+
+            if (content.is_null()) {
+                json oai_msg;
+                oai_msg["role"] = role;
+                oai_msg["content"] = "";
+                oai["messages"].push_back(oai_msg);
+                continue;
+            }
+
+            if (!content.is_array()) {
+                json oai_msg;
+                oai_msg["role"] = role;
+                oai_msg["content"] = "";
+                oai["messages"].push_back(oai_msg);
+                continue;
+            }
+
+            if (role == "assistant") {
+                // Translate tool_use blocks → tool_calls array; text/thinking → content
+                json oai_msg;
+                oai_msg["role"] = "assistant";
                 std::string text_content;
                 std::string reasoning_content;
-                text_content = flatten_anthropic_blocks_for_openai(content, tool_names_by_id, reasoning_content);
+                json tool_calls = json::array();
 
+                for (const auto& block : content) {
+                    if (!block.is_object()) {
+                        append_plain_text_section(text_content, flatten_plain_text_content(block));
+                        continue;
+                    }
+                    const std::string type = block.value("type", "text");
+                    if (type == "text") {
+                        append_plain_text_section(text_content, block.value("text", std::string()));
+                    } else if (type == "thinking") {
+                        reasoning_content += block.value("thinking", std::string());
+                    } else if (type == "tool_use") {
+                        const std::string tool_id = block.value("id", std::string());
+                        const std::string tool_name = block.value("name", std::string());
+                        if (!tool_id.empty() && !tool_name.empty()) {
+                            tool_names_by_id[tool_id] = tool_name;
+                        }
+                        const std::string arguments = block.contains("input") ? block["input"].dump() : "{}";
+                        json tc;
+                        tc["id"] = tool_id;
+                        tc["type"] = "function";
+                        tc["function"] = {{"name", tool_name}, {"arguments", arguments}};
+                        tool_calls.push_back(tc);
+                    }
+                }
+
+                oai_msg["content"] = text_content.empty() ? json(nullptr) : json(text_content);
                 if (!reasoning_content.empty()) {
                     oai_msg["reasoning_content"] = reasoning_content;
                 }
+                if (!tool_calls.empty()) {
+                    oai_msg["tool_calls"] = tool_calls;
+                }
+                oai["messages"].push_back(oai_msg);
 
-                oai_msg["content"] = text_content;
-            } else if (content.is_null()) {
-                oai_msg["content"] = "";
+            } else {
+                // user (or other) role: check for tool_result blocks
+                bool has_tool_results = false;
+                for (const auto& block : content) {
+                    if (block.is_object() && block.value("type", "") == "tool_result") {
+                        has_tool_results = true;
+                        break;
+                    }
+                }
+
+                if (has_tool_results) {
+                    // Emit any non-tool_result content first as a user message
+                    std::string user_text;
+                    for (const auto& block : content) {
+                        if (!block.is_object() || block.value("type", "") != "tool_result") {
+                            append_plain_text_section(user_text, flatten_plain_text_content(block));
+                        }
+                    }
+                    if (!user_text.empty()) {
+                        json user_msg;
+                        user_msg["role"] = "user";
+                        user_msg["content"] = user_text;
+                        oai["messages"].push_back(user_msg);
+                    }
+
+                    // Emit each tool_result as a separate role:tool message
+                    for (const auto& block : content) {
+                        if (!block.is_object() || block.value("type", "") != "tool_result") {
+                            continue;
+                        }
+                        const std::string tool_id = block.value("tool_use_id", std::string());
+                        std::string result_content;
+                        if (block.contains("content")) {
+                            result_content = flatten_plain_text_content(block["content"]);
+                        }
+                        json tool_msg;
+                        tool_msg["role"] = "tool";
+                        tool_msg["tool_call_id"] = tool_id;
+                        tool_msg["content"] = result_content;
+                        oai["messages"].push_back(tool_msg);
+                    }
+
+                } else {
+                    // No tool results: flatten as regular user message
+                    std::string text_content;
+                    std::string reasoning_content;
+                    text_content = flatten_anthropic_blocks_for_openai(content, tool_names_by_id, reasoning_content);
+                    json oai_msg;
+                    oai_msg["role"] = role;
+                    if (!reasoning_content.empty()) {
+                        oai_msg["reasoning_content"] = reasoning_content;
+                    }
+                    oai_msg["content"] = text_content;
+                    oai["messages"].push_back(oai_msg);
+                }
             }
-
-            oai["messages"].push_back(oai_msg);
         }
     }
 

@@ -44,3 +44,11 @@ target_include_directories(model-gateway PRIVATE
 target_link_libraries(model-gateway
     ${PLATFORM_LIBS}
 )
+
+if(APPLE)
+    enable_testing()
+    add_test(
+        NAME darwin_single_instance
+        COMMAND /bin/bash ${CMAKE_SOURCE_DIR}/tests/darwin_single_instance.sh $<TARGET_FILE:model-gateway>
+    )
+endif()

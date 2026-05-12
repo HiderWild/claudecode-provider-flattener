@@ -1,5 +1,6 @@
 # Build outputs
 /build/
+build-macos/
 build/
 /dist/
 /cmake-build-*/
@@ -22,6 +23,7 @@ compile_commands.json
 *.log
 *.tmp
 *.bak-*
+__pycache__/
 .omc/
 **/.omc/
 .claude/
