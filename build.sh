@@ -15,6 +15,9 @@ if [ "$platform" = "Darwin" ]; then
     echo "==> Building macOS binary..."
     cmake --build "$build_dir" --clean-first -j"$parallelism"
 
+    echo "==> Running local validation..."
+    ctest --test-dir "$build_dir" --output-on-failure
+
     echo "==> Installing to ~/.claude/model-gateway/bin/..."
     mkdir -p "$HOME/.claude/model-gateway/bin"
     install -m 755 "$build_dir/model-gateway" "$HOME/.claude/model-gateway/bin/model-gateway"
@@ -32,6 +35,9 @@ cmake -B build -S . -G "MinGW Makefiles"
 
 echo "==> Building Windows binary..."
 cmake --build build -j$(nproc)
+
+echo "==> Running local validation..."
+ctest --test-dir build --output-on-failure
 
 echo "==> Installing to ~/.claude/model-gateway/"
 mkdir -p "$HOME/.claude/model-gateway/bin"

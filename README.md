@@ -42,12 +42,27 @@ Windows (MinGW):
 ```powershell
 cmake -B build -S . -G "MinGW Makefiles"
 cmake --build build
+ctest --test-dir build --output-on-failure
+```
+
+Windows (Visual Studio / GitHub Actions style):
+
+```powershell
+cmake -B build-msvc -S . -A x64
+cmake --build build-msvc --config Release
+ctest --test-dir build-msvc -C Release --output-on-failure
 ```
 
 Or use the helper script:
 
 ```bash
 ./build.sh
+```
+
+macOS local validation:
+
+```bash
+ctest --test-dir build-macos --output-on-failure
 ```
 
 ### 2. Run the gateway
@@ -111,6 +126,33 @@ The installed runtime uses the user-scoped Claude directory:
 - config: `~/.claude/model-gateway/config.json`
 
 On macOS and Windows, a second gateway instance now fails fast instead of sharing the same port or process role. Concurrency stays inside one process via the configured thread pool.
+
+## CI and build environment
+
+GitHub Actions currently uses two release workflows:
+
+- Windows release: [release-windows.yml](.github/workflows/release-windows.yml) runs on `windows-latest`, configures CMake with the Visual Studio generator (`-A x64`), builds `Release`, runs `ctest -C Release`, then publishes a versioned `.exe` and `.zip`.
+- macOS ARM64 release: [release-macos-arm64.yml](.github/workflows/release-macos-arm64.yml) runs on `macos-14`, which is GitHub's Apple Silicon runner, builds with Apple Clang + CMake, runs `ctest`, then publishes a versioned binary and `.tar.gz` package.
+
+Both workflows trigger on `v*` tags and can also be run manually through `workflow_dispatch`.
+
+## Local build stack
+
+The local build and validation flow is intentionally small and conventional:
+
+- Language/runtime: C++17
+- Build system: CMake 3.16+
+- HTTP/runtime libs: `cpp-httplib`, `nlohmann/json`
+- Windows platform APIs: WinHTTP, Winsock (`ws2_32`)
+- macOS platform deps: OpenSSL, `Security`, `CoreFoundation`, `CFNetwork`
+- Validation tooling: `ctest`, PowerShell on Windows, Bash + `curl` on macOS
+
+For local smoke tests, the repo now includes platform-specific startup validation that:
+
+- boots the compiled gateway under a temporary HOME/USERPROFILE
+- checks `/v1/models` and `/api/monitor`
+- verifies `/v1/messages/count_tokens` without needing real upstream credentials
+- confirms that a second instance fails with the expected single-instance lock error
 
 ### 3. Point Claude Code at the gateway
 

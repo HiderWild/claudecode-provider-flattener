@@ -17,37 +17,53 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v4
 
+      - name: Compute asset names
+        id: names
+        shell: pwsh
+        run: |
+          if ("${{ github.ref_type }}" -eq "tag") {
+            $version = "${{ github.ref_name }}"
+          } else {
+            $version = "manual-${{ github.run_number }}"
+          }
+          $assetStem = "claudecode-provider-flattener-$version-windows-x64"
+          "ASSET_STEM=$assetStem" >> $env:GITHUB_ENV
+          "asset_stem=$assetStem" >> $env:GITHUB_OUTPUT
+
       - name: Configure CMake
         run: cmake -B build -S . -A x64
 
       - name: Build Release
         run: cmake --build build --config Release
 
+      - name: Run tests
+        run: ctest --test-dir build -C Release --output-on-failure
+
       - name: Prepare package
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path dist | Out-Null
-          Copy-Item build/Release/model-gateway.exe dist/
+          Copy-Item build/Release/model-gateway.exe "dist/$env:ASSET_STEM.exe"
           Copy-Item README.md dist/
-          $packageItems = @('dist/model-gateway.exe', 'dist/README.md')
+          $packageItems = @("dist/$env:ASSET_STEM.exe", 'dist/README.md')
           if (Test-Path start.bat) {
             Copy-Item start.bat dist/
             $packageItems += 'dist/start.bat'
           }
-          Compress-Archive -Path $packageItems -DestinationPath dist/claudecode-provider-flattener-windows-x64.zip -Force
+          Compress-Archive -Path $packageItems -DestinationPath "dist/$env:ASSET_STEM.zip" -Force
 
       - name: Upload workflow artifact
         uses: actions/upload-artifact@v4
         with:
-          name: claudecode-provider-flattener-windows-x64
+          name: ${{ steps.names.outputs.asset_stem }}
           path: |
-            dist/model-gateway.exe
-            dist/claudecode-provider-flattener-windows-x64.zip
+            dist/${{ steps.names.outputs.asset_stem }}.exe
+            dist/${{ steps.names.outputs.asset_stem }}.zip
 
       - name: Publish GitHub release assets
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            dist/model-gateway.exe
-            dist/claudecode-provider-flattener-windows-x64.zip
+            dist/${{ steps.names.outputs.asset_stem }}.exe
+            dist/${{ steps.names.outputs.asset_stem }}.zip

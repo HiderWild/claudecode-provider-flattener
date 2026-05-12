@@ -45,8 +45,14 @@ target_link_libraries(model-gateway
     ${PLATFORM_LIBS}
 )
 
-if(APPLE)
-    enable_testing()
+enable_testing()
+
+if(WIN32)
+    add_test(
+        NAME win32_smoke
+        COMMAND powershell -NoProfile -ExecutionPolicy Bypass -File ${CMAKE_SOURCE_DIR}/tests/win32_smoke.ps1 $<TARGET_FILE:model-gateway>
+    )
+elseif(APPLE)
     add_test(
         NAME darwin_single_instance
         COMMAND /bin/bash ${CMAKE_SOURCE_DIR}/tests/darwin_single_instance.sh $<TARGET_FILE:model-gateway>

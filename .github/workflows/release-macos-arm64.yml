@@ -1,0 +1,66 @@
+name: release-macos-arm64
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-release:
+    runs-on: macos-14
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Compute asset names
+        id: names
+        run: |
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            version="${{ github.ref_name }}"
+          else
+            version="manual-${{ github.run_number }}"
+          fi
+          asset_stem="claudecode-provider-flattener-${version}-macos-arm64"
+          echo "ASSET_STEM=$asset_stem" >> "$GITHUB_ENV"
+          echo "asset_stem=$asset_stem" >> "$GITHUB_OUTPUT"
+
+      - name: Configure CMake
+        run: cmake -B build-macos -S . -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build Release
+        run: cmake --build build-macos --parallel
+
+      - name: Run tests
+        run: ctest --test-dir build-macos --output-on-failure
+
+      - name: Prepare package
+        run: |
+          mkdir -p dist
+          install -m 755 build-macos/model-gateway "dist/$ASSET_STEM"
+          install -m 644 README.md dist/README.md
+          install -m 755 darwin/install-launchd.sh dist/install-launchd.sh
+          install -m 644 darwin/com.claudecode.model-gateway.plist.template dist/com.claudecode.model-gateway.plist.template
+          tar -czf "dist/$ASSET_STEM.tar.gz" \
+            -C dist \
+            "$ASSET_STEM" README.md install-launchd.sh com.claudecode.model-gateway.plist.template
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.names.outputs.asset_stem }}
+          path: |
+            dist/${{ steps.names.outputs.asset_stem }}
+            dist/${{ steps.names.outputs.asset_stem }}.tar.gz
+
+      - name: Publish GitHub release assets
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/${{ steps.names.outputs.asset_stem }}
+            dist/${{ steps.names.outputs.asset_stem }}.tar.gz

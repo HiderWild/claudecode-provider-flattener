@@ -308,7 +308,8 @@ let unsaved = false;
 let monitorIntervalId = null;
 let controlPlaneToken = localStorage.getItem('gateway_admin_token') || '';
 
-function toast(msg, type="info") {
+)HTML"
+R"HTML(function toast(msg, type="info") {
   const t = document.getElementById('toast');
   t.textContent = msg; t.className = type + ' show';
   setTimeout(()=>t.className='', 3000);
@@ -669,7 +670,8 @@ function countAliasReferencesForModel(modelId) {
   return count;
 }
 
-function renderModelRoutes() {
+)HTML"
+R"HTML(function renderModelRoutes() {
   const list = document.getElementById('modelsList');
   const modelEntries = Object.entries(config.models || {}).sort((a, b) => a[0].localeCompare(b[0], 'zh-CN'));
   if (!modelEntries.length) {
@@ -735,7 +737,8 @@ function renderModelRoutes() {
   }).join('');
 }
 
-function render() {
+)HTML"
+R"HTML(function render() {
   ensureConfigShape();
   document.getElementById('port').value = config.port || 8080;
   document.getElementById('bind').value = config.bind || '127.0.0.1';
@@ -850,7 +853,8 @@ function updateAliasModelsDropdown() {
   }
 }
 
-function updateProvider(idx, field, val) {
+)HTML"
+R"HTML(function updateProvider(idx, field, val) {
   const oldVal = config.providers[idx][field];
   config.providers[idx][field] = val;
   if (field === 'id' && oldVal && oldVal !== val) {
@@ -1069,7 +1073,8 @@ function setMonitorDisconnected(message = '监控接口不可达') {
   document.getElementById('statusMeta').textContent = message;
 }
 
-function renderMonitor() {
+)HTML"
+R"HTML(function renderMonitor() {
   if (!monitor) {
     setMonitorDisconnected('等待监控数据...');
     return;
@@ -1192,7 +1197,8 @@ function renderMonitor() {
   }
 }
 
-async function loadMonitor(showToast = false) {
+)HTML"
+R"HTML(async function loadMonitor(showToast = false) {
   try {
     const r = await gatewayFetch('/api/monitor');
     if (r.status === 401) {
