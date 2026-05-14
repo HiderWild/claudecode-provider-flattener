@@ -33,10 +33,13 @@ public:
     struct StreamControl {
         void cancel();
         bool is_cancelled() const;
+        void set_cancel_handler(std::function<void()> handler);
+        void clear_cancel_handler();
 
     private:
         mutable std::mutex mtx_;
         bool cancelled_ = false;
+        std::function<void()> cancel_handler_;
     };
 
     struct Response {

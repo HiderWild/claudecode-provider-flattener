@@ -1,9 +1,26 @@
 #include "server_thread_pool.h"
 
+#include <atomic>
 #include <chrono>
 
 namespace {
 constexpr auto kDynamicThreadIdleTimeout = std::chrono::seconds(3);
+std::atomic<size_t> g_current_worker_count{0};
+
+class WorkerCountScope final {
+public:
+    WorkerCountScope() {
+        g_current_worker_count.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    ~WorkerCountScope() {
+        g_current_worker_count.fetch_sub(1, std::memory_order_relaxed);
+    }
+};
+}
+
+size_t ServerThreadPool::currentWorkerCount() {
+    return g_current_worker_count.load(std::memory_order_relaxed);
 }
 
 ServerThreadPool::ServerThreadPool(size_t configured_size)
@@ -11,8 +28,10 @@ ServerThreadPool::ServerThreadPool(size_t configured_size)
       max_thread_count_(configured_size),
       unbounded_(configured_size == 0) {
     threads_.reserve(base_thread_count_);
-    for (size_t i = 0; i < base_thread_count_; ++i) {
-        threads_.emplace_back([this]() { worker(false); });
+    if (unbounded_) {
+        for (size_t i = 0; i < base_thread_count_; ++i) {
+            threads_.emplace_back([this]() { worker(false); });
+        }
     }
 }
 
@@ -25,14 +44,26 @@ bool ServerThreadPool::enqueue(std::function<void()> fn) {
 
         jobs_.push_back(std::move(fn));
 
-        if (unbounded_ && idle_thread_count_ == 0) {
+        const bool needs_more_capacity = jobs_.size() > idle_thread_count_;
+        if (unbounded_ && needs_more_capacity) {
             cleanup_finished_threads_locked();
-            dynamic_threads_.emplace_back([this]() { worker(true); });
+            start_worker_locked(true);
+        } else if (!unbounded_ && needs_more_capacity && threads_.size() < max_thread_count_) {
+            start_worker_locked(false);
         }
     }
 
     cond_.notify_one();
     return true;
+}
+
+void ServerThreadPool::start_worker_locked(bool dynamic_worker) {
+    if (dynamic_worker) {
+        dynamic_threads_.emplace_back([this]() { worker(true); });
+        return;
+    }
+
+    threads_.emplace_back([this]() { worker(false); });
 }
 
 void ServerThreadPool::shutdown() {
@@ -71,6 +102,8 @@ void ServerThreadPool::shutdown() {
 }
 
 void ServerThreadPool::worker(bool dynamic_worker) {
+    WorkerCountScope worker_count_scope;
+
     for (;;) {
         std::function<void()> fn;
 

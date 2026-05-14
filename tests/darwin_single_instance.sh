@@ -45,6 +45,8 @@ EOF
 
 first_log="$temp_root/first.log"
 second_log="$temp_root/second.log"
+runtime_log="$(cd "$(dirname "$binary")" && pwd)/model-gateway.log"
+pid_file="$home_dir/.claude/model-gateway/model-gateway.pid"
 first_pid=""
 second_pid=""
 
@@ -61,7 +63,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-HOME="$home_dir" USERPROFILE="$home_dir" "$binary" --show "$port" >"$first_log" 2>&1 &
+HOME="$home_dir" USERPROFILE="$home_dir" "$binary" "$port" >"$first_log" 2>&1 &
 first_pid="$!"
 
 for _ in $(seq 1 50); do
@@ -74,6 +76,20 @@ done
 if ! curl -sf "http://127.0.0.1:$port/v1/models" >/dev/null 2>&1; then
     echo "first instance did not become ready" >&2
     cat "$first_log" >&2 || true
+    exit 1
+fi
+
+if [[ ! -f "$pid_file" ]]; then
+    echo "expected runtime pid file to be created" >&2
+    ls -la "$home_dir/.claude/model-gateway" >&2 || true
+    exit 1
+fi
+
+pid_value="$(tr -d '[:space:]' < "$pid_file")"
+if [[ "$pid_value" != "$first_pid" ]]; then
+    echo "expected runtime pid file to match running process" >&2
+    echo "pid file: $pid_value" >&2
+    echo "actual : $first_pid" >&2
     exit 1
 fi
 
@@ -91,6 +107,12 @@ if ! grep -Eq '"listener"[[:space:]]*:[[:space:]]*"http://127.0.0.1:'"$port"'"' 
     exit 1
 fi
 
+if ! grep -Eq '"current_thread_pool_size"[[:space:]]*:[[:space:]]*[1-3]' <<<"$monitor_json"; then
+    echo "expected fixed thread pool to lazily create fewer than the configured 4 workers under light load" >&2
+    echo "$monitor_json" >&2
+    exit 1
+fi
+
 count_tokens_json="$(curl -sf \
     -H 'Content-Type: application/json' \
     -d '{"model":"test","messages":[{"role":"user","content":"Count these tokens locally."}]}' \
@@ -102,7 +124,7 @@ if ! grep -Eq '"input_tokens"[[:space:]]*:[[:space:]]*[1-9][0-9]*' <<<"$count_to
 fi
 
 set +e
-HOME="$home_dir" USERPROFILE="$home_dir" "$binary" --show "$second_port" >"$second_log" 2>&1 &
+HOME="$home_dir" USERPROFILE="$home_dir" "$binary" "$second_port" >"$second_log" 2>&1 &
 second_pid="$!"
 set -e
 
@@ -120,8 +142,10 @@ if wait "$second_pid"; then
     exit 1
 fi
 
-if ! grep -q "another gateway instance is already running" "$second_log"; then
+if ! grep -q "another gateway instance is already running" "$second_log" 2>/dev/null && \
+   ! grep -q "another gateway instance is already running" "$runtime_log" 2>/dev/null; then
     echo "second instance did not fail with the expected lock error" >&2
     cat "$second_log" >&2 || true
+    cat "$runtime_log" >&2 || true
     exit 1
 fi

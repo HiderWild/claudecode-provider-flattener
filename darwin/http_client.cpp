@@ -48,9 +48,35 @@ HttpClient::UrlParts HttpClient::parse_url(const std::string& url) {
 
 // ─── StreamControl ──────────────────────────────────────────────────────────
 
-void HttpClient::StreamControl::cancel() {
+void HttpClient::StreamControl::set_cancel_handler(std::function<void()> handler) {
+    std::function<void()> cancel_handler;
+    {
+        std::lock_guard<std::mutex> lock(mtx_);
+        cancel_handler_ = std::move(handler);
+        if (cancelled_) {
+            cancel_handler = cancel_handler_;
+        }
+    }
+    if (cancel_handler) {
+        cancel_handler();
+    }
+}
+
+void HttpClient::StreamControl::clear_cancel_handler() {
     std::lock_guard<std::mutex> lock(mtx_);
-    cancelled_ = true;
+    cancel_handler_ = nullptr;
+}
+
+void HttpClient::StreamControl::cancel() {
+    std::function<void()> cancel_handler;
+    {
+        std::lock_guard<std::mutex> lock(mtx_);
+        cancelled_ = true;
+        cancel_handler = cancel_handler_;
+    }
+    if (cancel_handler) {
+        cancel_handler();
+    }
 }
 
 bool HttpClient::StreamControl::is_cancelled() const {
@@ -73,15 +99,15 @@ static httplib::Headers build_headers(const std::map<std::string, std::string>& 
     return h;
 }
 
-static std::unique_ptr<httplib::ClientImpl> make_client(const std::string& host, int port, bool is_https) {
+static std::shared_ptr<httplib::ClientImpl> make_client(const std::string& host, int port, bool is_https) {
     if (is_https) {
 #ifdef CPPHTTPLIB_OPENSSL_SUPPORT
-        return std::make_unique<httplib::SSLClient>(host, port);
+        return std::make_shared<httplib::SSLClient>(host, port);
 #else
         return nullptr;
 #endif
     }
-    return std::make_unique<httplib::ClientImpl>(host, port);
+    return std::make_shared<httplib::ClientImpl>(host, port);
 }
 
 // ─── GET ────────────────────────────────────────────────────────────────────
@@ -188,27 +214,65 @@ HttpClient::Response HttpClient::postStream(
         cli->set_connection_timeout(std::chrono::milliseconds(timeout_ms));
         cli->set_read_timeout(std::chrono::milliseconds(timeout_ms));
 
-        // Use ContentReceiver-based Post for streaming
-        auto result = cli->Post(parts.path, build_headers(headers), body, content_type,
-            [&](const char* data, size_t len) {
-                if (stream_control && stream_control->is_cancelled()) {
-                    return false;
+        if (stream_control) {
+            std::weak_ptr<httplib::ClientImpl> weak_cli = cli;
+            stream_control->set_cancel_handler([weak_cli]() {
+                if (auto strong_cli = weak_cli.lock()) {
+                    strong_cli->stop();
                 }
-                if (chunk_cb) {
-                    return chunk_cb(data, len);
-                }
-                resp.body.append(data, len);
-                return true;
-            }
-        );
+            });
+        }
 
-        if (result) {
-            resp.status_code = result->status;
-            notify_status(result->status);
-        } else {
-            resp.status_code = 503;
-            notify_status(503);
-            std::cerr << "[http] POST stream failed: " << static_cast<int>(result.error()) << std::endl;
+        auto clear_cancel_handler = [&]() {
+            if (stream_control) {
+                stream_control->clear_cancel_handler();
+            }
+        };
+
+        httplib::Request req;
+        req.method = "POST";
+        req.path = parts.path;
+        req.headers = build_headers(headers);
+        if (!content_type.empty() && req.headers.find("Content-Type") == req.headers.end()) {
+            req.headers.emplace("Content-Type", content_type);
+        }
+        req.body = body;
+        req.response_handler = [&](const httplib::Response& response) {
+            resp.status_code = response.status;
+            notify_status(response.status);
+            return !(stream_control && stream_control->is_cancelled());
+        };
+        req.content_receiver = [&](const char* data, size_t data_length, size_t /*offset*/, size_t /*total_length*/) {
+            if (stream_control && stream_control->is_cancelled()) {
+                return false;
+            }
+            if (chunk_cb) {
+                return chunk_cb(data, data_length);
+            }
+            resp.body.append(data, data_length);
+            return true;
+        };
+
+        httplib::Response upstream_response;
+        httplib::Error error = httplib::Error::Success;
+        const bool ok = cli->send(req, upstream_response, error);
+        clear_cancel_handler();
+
+        if (!ok) {
+            if (resp.status_code == 0) {
+                resp.status_code = 503;
+                notify_status(503);
+            }
+            const bool cancelled = stream_control && stream_control->is_cancelled();
+            if (!cancelled) {
+                std::cerr << "[http] POST stream failed: " << static_cast<int>(error) << std::endl;
+            }
+            return resp;
+        }
+
+        if (resp.status_code == 0) {
+            resp.status_code = upstream_response.status;
+            notify_status(resp.status_code);
         }
     } catch (const std::exception& e) {
         std::cerr << "[http] POST stream exception: " << e.what() << std::endl;

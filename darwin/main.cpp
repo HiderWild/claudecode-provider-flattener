@@ -131,6 +131,10 @@ static std::string get_instance_lock_path() {
     return Config::getConfigDir() + "/model-gateway.lock";
 }
 
+static std::string get_runtime_pid_path() {
+    return Config::getConfigDir() + "/model-gateway.pid";
+}
+
 static std::string get_home_directory() {
     const char* home = getenv("HOME");
     if (!home) home = getenv("USERPROFILE");
@@ -175,6 +179,36 @@ static std::string read_lock_holder_pid(int fd) {
         return std::isspace(ch) != 0;
     }), pid_text.end());
     return pid_text;
+}
+
+static bool write_runtime_pid_file(std::string& error_message) {
+    const std::string pid_path = get_runtime_pid_path();
+    const int fd = open(pid_path.c_str(), O_CREAT | O_TRUNC | O_WRONLY, 0644);
+    if (fd < 0) {
+        error_message = "failed to open pid file " + redact_local_path(pid_path) + ": " +
+            std::string(strerror(errno));
+        return false;
+    }
+
+    const std::string pid_text = std::to_string(getpid()) + "\n";
+    const bool write_ok = write(fd, pid_text.c_str(), pid_text.size()) ==
+        static_cast<ssize_t>(pid_text.size());
+    const int write_errno = errno;
+    close(fd);
+
+    if (!write_ok) {
+        error_message = "failed to write pid file " + redact_local_path(pid_path) + ": " +
+            std::string(strerror(write_errno));
+        unlink(pid_path.c_str());
+        return false;
+    }
+
+    return true;
+}
+
+static void remove_runtime_pid_file() {
+    const std::string pid_path = get_runtime_pid_path();
+    unlink(pid_path.c_str());
 }
 
 static bool acquire_instance_lock(std::string& error_message) {
@@ -230,10 +264,22 @@ static bool acquire_instance_lock(std::string& error_message) {
 
     g_instance_lock_fd = fd;
     g_instance_lock_path = lock_path;
+
+    if (!write_runtime_pid_file(error_message)) {
+        flock(fd, LOCK_UN);
+        close(fd);
+        g_instance_lock_fd = -1;
+        unlink(lock_path.c_str());
+        g_instance_lock_path.clear();
+        return false;
+    }
+
     return true;
 }
 
 static void release_instance_lock() {
+    remove_runtime_pid_file();
+
     if (g_instance_lock_fd >= 0) {
         flock(g_instance_lock_fd, LOCK_UN);
         close(g_instance_lock_fd);
@@ -246,10 +292,59 @@ static void release_instance_lock() {
     }
 }
 
+static const char* shutdown_signal_name(int signum) {
+    switch (signum) {
+        case SIGHUP:
+            return "SIGHUP";
+        case SIGINT:
+            return "SIGINT";
+        case SIGTERM:
+            return "SIGTERM";
+        default:
+            return "UNKNOWN_SIGNAL";
+    }
+}
+
+static bool detach_from_terminal_if_needed(bool show_console,
+                                           std::string& error_message) {
+    if (show_console) {
+        return true;
+    }
+
+    if (signal(SIGHUP, SIG_IGN) == SIG_ERR) {
+        error_message = "failed to ignore SIGHUP: " + std::string(strerror(errno));
+        return false;
+    }
+
+    const int devnull = open("/dev/null", O_RDWR);
+    if (devnull < 0) {
+        error_message = "failed to open /dev/null: " + std::string(strerror(errno));
+        return false;
+    }
+
+    if (dup2(devnull, STDIN_FILENO) < 0 ||
+        dup2(devnull, STDOUT_FILENO) < 0 ||
+        dup2(devnull, STDERR_FILENO) < 0) {
+        error_message = "failed to redirect stdio to /dev/null: " + std::string(strerror(errno));
+        close(devnull);
+        return false;
+    }
+
+    if (devnull > STDERR_FILENO) {
+        close(devnull);
+    }
+
+    return true;
+}
+
 static bool install_signal_waiter(sigset_t& signal_set,
                                   httplib::Server& svr,
+                                  bool include_sighup,
                                   std::string& error_message) {
     sigemptyset(&signal_set);
+    if (include_sighup) {
+        sigaddset(&signal_set, SIGHUP);
+    }
     sigaddset(&signal_set, SIGINT);
     sigaddset(&signal_set, SIGTERM);
 
@@ -761,6 +856,12 @@ static int run_gateway_server(const StartupOptions& options) {
     const bool show_console = options.show_console;
     g_console_visible = show_console;
 
+    std::string detach_error;
+    if (!detach_from_terminal_if_needed(show_console, detach_error)) {
+        log_error("[gateway] " + detach_error, true);
+        return 1;
+    }
+
     if (show_console) {
         std::cout << "+------------------------------------------+" << std::endl;
         std::cout << "|     Model Gateway v1.0.0                 |" << std::endl;
@@ -853,7 +954,7 @@ static int run_gateway_server(const StartupOptions& options) {
 
     sigset_t signal_set;
     std::string signal_error;
-    if (!install_signal_waiter(signal_set, svr, signal_error)) {
+    if (!install_signal_waiter(signal_set, svr, show_console, signal_error)) {
         log_error("[gateway] " + signal_error, true);
         return 1;
     }
@@ -862,7 +963,9 @@ static int run_gateway_server(const StartupOptions& options) {
 
     if (!listen_ok) {
         if (g_shutdown_signal != 0) {
-            log_info("[gateway] shutdown requested", show_console);
+            log_info(std::string("[gateway] shutdown requested (") +
+                         shutdown_signal_name(g_shutdown_signal) + ")",
+                     show_console);
             return 0;
         }
         log_error("[gateway] failed to start on " + addr + ":" + std::to_string(port),
@@ -871,7 +974,9 @@ static int run_gateway_server(const StartupOptions& options) {
     }
 
     if (g_shutdown_signal != 0) {
-        log_info("[gateway] shutdown requested", show_console);
+        log_info(std::string("[gateway] shutdown requested (") +
+                     shutdown_signal_name(g_shutdown_signal) + ")",
+                 show_console);
         return 0;
     }
 
@@ -1245,7 +1350,9 @@ static void handle_messages(const httplib::Request& req, httplib::Response& res)
         auto buf = std::make_shared<StreamBuffer>();
         int status_code = 503;
 
-        ProviderRouter::instance().chatStream(cfg, req.body, request_context, buf, status_code);
+        ProviderRouter::instance().chatStream(cfg, req.body, request_context, buf, status_code, [&req]() {
+            return req.is_connection_closed && req.is_connection_closed();
+        });
 
         if (status_code >= 400) {
             std::string error_payload;
@@ -1344,6 +1451,9 @@ static void handle_get_monitor(const httplib::Request& req, httplib::Response& r
     if (!ensure_control_plane_access(req, res)) {
         return;
     }
+    if (req.is_connection_closed && req.is_connection_closed()) {
+        return;
+    }
     const Config cfg = get_config_snapshot();
     const auto now_wall = std::chrono::system_clock::now();
     const auto now_steady = std::chrono::steady_clock::now();
@@ -1355,6 +1465,9 @@ static void handle_get_monitor(const httplib::Request& req, httplib::Response& r
     {
         std::lock_guard<std::mutex> lock(g_active_streams_mutex);
         for (const auto& [stream_id, monitor] : g_active_streams) {
+            if (req.is_connection_closed && req.is_connection_closed()) {
+                return;
+            }
             json stream_json;
             stream_json["id"] = stream_id;
             stream_json["model"] = monitor.model;
@@ -1395,6 +1508,9 @@ static void handle_get_monitor(const httplib::Request& req, httplib::Response& r
         std::vector<SessionMonitor> session_rows;
         std::lock_guard<std::mutex> lock(g_sessions_mutex);
         for (const auto& [_, session] : g_sessions) {
+            if (req.is_connection_closed && req.is_connection_closed()) {
+                return;
+            }
             session_rows.push_back(session);
         }
         std::sort(session_rows.begin(), session_rows.end(), [](const SessionMonitor& lhs, const SessionMonitor& rhs) {
@@ -1432,6 +1548,7 @@ static void handle_get_monitor(const httplib::Request& req, httplib::Response& r
         {"active_streams", streams.size()},
         {"buffered_bytes", total_buffered_bytes},
         {"configured_thread_pool_size", cfg.thread_pool_size},
+        {"current_thread_pool_size", ServerThreadPool::currentWorkerCount()},
         {"effective_thread_pool_size", g_effective_thread_pool_size},
         {"thread_pool_mode", cfg.thread_pool_size == 0 ? "unbounded" : "fixed"},
         {"console_visible", g_console_visible},
@@ -1455,6 +1572,9 @@ static void handle_get_monitor(const httplib::Request& req, httplib::Response& r
     monitor["sessions"] = std::move(sessions);
     monitor["streams"] = std::move(streams);
 
+    if (req.is_connection_closed && req.is_connection_closed()) {
+        return;
+    }
     res.set_content(monitor.dump(2), "application/json");
 }
 

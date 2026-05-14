@@ -57,4 +57,8 @@ elseif(APPLE)
         NAME darwin_single_instance
         COMMAND /bin/bash ${CMAKE_SOURCE_DIR}/tests/darwin_single_instance.sh $<TARGET_FILE:model-gateway>
     )
+    add_test(
+        NAME darwin_stream_responsiveness
+        COMMAND /bin/bash ${CMAKE_SOURCE_DIR}/tests/darwin_stream_responsiveness.sh $<TARGET_FILE:model-gateway>
+    )
 endif()

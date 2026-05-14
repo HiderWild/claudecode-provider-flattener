@@ -2,6 +2,7 @@
 
 #include <httplib.h>
 
+#include <atomic>
 #include <condition_variable>
 #include <functional>
 #include <list>
@@ -15,10 +16,13 @@ public:
 
     explicit ServerThreadPool(size_t configured_size);
 
+    static size_t currentWorkerCount();
+
     bool enqueue(std::function<void()> fn) override;
     void shutdown() override;
 
 private:
+    void start_worker_locked(bool dynamic_worker);
     void worker(bool dynamic_worker);
     void move_dynamic_to_finished_locked(std::thread::id id);
     void cleanup_finished_threads_locked();

@@ -17,6 +17,7 @@ $firstStdout = Join-Path $tempRoot 'first.stdout.log'
 $firstStderr = Join-Path $tempRoot 'first.stderr.log'
 $secondStdout = Join-Path $tempRoot 'second.stdout.log'
 $secondStderr = Join-Path $tempRoot 'second.stderr.log'
+$runtimeLogPath = Join-Path (Split-Path $BinaryPath -Parent) 'model-gateway.log'
 
 $firstProcess = $null
 $secondProcess = $null
@@ -88,7 +89,7 @@ try {
     $env:HOME = $homeDir
     $env:USERPROFILE = $homeDir
 
-    $firstProcess = Start-Process -FilePath $BinaryPath -ArgumentList @('--show', "$port") -PassThru -RedirectStandardOutput $firstStdout -RedirectStandardError $firstStderr
+    $firstProcess = Start-Process -FilePath $BinaryPath -ArgumentList @("$port") -PassThru -RedirectStandardOutput $firstStdout -RedirectStandardError $firstStderr
 
     $ready = $false
     for ($attempt = 0; $attempt -lt 50; $attempt++) {
@@ -129,7 +130,7 @@ try {
         throw "count_tokens did not return a positive input_tokens value"
     }
 
-    $secondProcess = Start-Process -FilePath $BinaryPath -ArgumentList @('--show', "$secondPort") -PassThru -RedirectStandardOutput $secondStdout -RedirectStandardError $secondStderr
+    $secondProcess = Start-Process -FilePath $BinaryPath -ArgumentList @("$secondPort") -PassThru -RedirectStandardOutput $secondStdout -RedirectStandardError $secondStderr
     $null = $secondProcess.WaitForExit(5000)
 
     if (-not $secondProcess.HasExited) {
@@ -140,7 +141,7 @@ try {
         throw "second instance exited successfully; expected failure`n$(Get-CombinedLog @($secondStdout, $secondStderr))"
     }
 
-    $secondLog = Get-CombinedLog @($secondStdout, $secondStderr)
+    $secondLog = Get-CombinedLog @($secondStdout, $secondStderr, $runtimeLogPath)
     if ($secondLog -notmatch 'another gateway instance is already running') {
         throw "second instance did not fail with the expected lock error`n$secondLog"
     }

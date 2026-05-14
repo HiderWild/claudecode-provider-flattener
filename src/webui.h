@@ -306,6 +306,7 @@ let config = {port:8080,bind:"127.0.0.1",thread_pool_size:8,admin_token:"",provi
 let monitor = null;
 let unsaved = false;
 let monitorIntervalId = null;
+let monitorRequestController = null;
 let controlPlaneToken = localStorage.getItem('gateway_admin_token') || '';
 
 )HTML"
@@ -384,6 +385,13 @@ function getControlPlaneHeaders(extraHeaders = {}) {
 
 async function gatewayFetch(url, options = {}) {
   return fetch(url, {...options, headers: getControlPlaneHeaders(options.headers || {})});
+}
+
+function cancelMonitorRequest() {
+  if (monitorRequestController) {
+    monitorRequestController.abort();
+    monitorRequestController = null;
+  }
 }
 
 function updateAccessTokenState(message, tone = 'muted') {
@@ -1091,8 +1099,14 @@ R"HTML(function renderMonitor() {
   document.getElementById('totalRequestsDisplay').textContent = formatNumber(counters.total_requests);
   document.getElementById('uptimeDisplay').textContent = formatDuration(monitor.uptime_seconds);
   document.getElementById('startedAtDisplay').textContent = `启动时间 ${formatTime(monitor.started_at_unix_ms)}`;
-  document.getElementById('threadPoolDisplay').textContent = runtime.thread_pool_mode === 'unbounded' ? '无限制' : `${formatNumber(runtime.effective_thread_pool_size)} 线程`;
-  document.getElementById('threadPoolMeta').textContent = `配置 ${formatNumber(runtime.configured_thread_pool_size)} · 实际 ${formatNumber(runtime.effective_thread_pool_size)}`;
+  const currentThreadPoolSize = runtime.current_thread_pool_size ?? runtime.effective_thread_pool_size;
+  if (runtime.thread_pool_mode === 'unbounded') {
+    document.getElementById('threadPoolDisplay').textContent = `${formatNumber(currentThreadPoolSize)} 线程`;
+    document.getElementById('threadPoolMeta').textContent = '动态扩容';
+  } else {
+    document.getElementById('threadPoolDisplay').textContent = `${formatNumber(currentThreadPoolSize)} / ${formatNumber(runtime.configured_thread_pool_size)} 线程`;
+    document.getElementById('threadPoolMeta').textContent = `已创建 ${formatNumber(currentThreadPoolSize)} · 上限 ${formatNumber(runtime.configured_thread_pool_size)}`;
+  }
   document.getElementById('threadCountDisplay').textContent = formatNumber(runtime.thread_count);
   document.getElementById('pidDisplay').textContent = `PID ${formatNumber(runtime.process_id)}`;
   document.getElementById('bufferDisplay').textContent = formatBytes(runtime.buffered_bytes);
@@ -1198,9 +1212,22 @@ R"HTML(function renderMonitor() {
 }
 
 )HTML"
-R"HTML(async function loadMonitor(showToast = false) {
+R"HTML(async function loadMonitor(showToast = false, force = false) {
+  if (document.visibilityState === 'hidden') {
+    return;
+  }
+
+  if (monitorRequestController) {
+    if (!force) {
+      return;
+    }
+    cancelMonitorRequest();
+  }
+
+  const controller = new AbortController();
+  monitorRequestController = controller;
   try {
-    const r = await gatewayFetch('/api/monitor');
+    const r = await gatewayFetch('/api/monitor', {signal: controller.signal});
     if (r.status === 401) {
       handleAuthFailure('/api/monitor');
       throw new Error('HTTP 401');
@@ -1210,16 +1237,23 @@ R"HTML(async function loadMonitor(showToast = false) {
     renderMonitor();
     if (showToast) toast('监控数据已刷新', 'info');
   } catch (e) {
+    if (e.name === 'AbortError') {
+      return;
+    }
     if (e.message !== 'HTTP 401') {
       setMonitorDisconnected('监控接口不可达: ' + e.message);
       if (showToast) toast('监控刷新失败: ' + e.message, 'error');
+    }
+  } finally {
+    if (monitorRequestController === controller) {
+      monitorRequestController = null;
     }
   }
 }
 
 async function refreshAll(showToast = false) {
   await loadConfig(false);
-  await loadMonitor(showToast);
+  await loadMonitor(showToast, true);
 }
 
 async function testProvider(providerId) {
@@ -1272,8 +1306,22 @@ async function saveConfig() {
   }
 }
 
-loadConfig(false).then(() => loadMonitor(false));
+loadConfig(false).then(() => loadMonitor(false, true));
 monitorIntervalId = setInterval(() => loadMonitor(false), 3000);
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'hidden') {
+    cancelMonitorRequest();
+    return;
+  }
+  loadMonitor(false, true);
+});
+window.addEventListener('pagehide', () => {
+  if (monitorIntervalId) {
+    clearInterval(monitorIntervalId);
+    monitorIntervalId = null;
+  }
+  cancelMonitorRequest();
+});
 </script>
 </body>
 </html>

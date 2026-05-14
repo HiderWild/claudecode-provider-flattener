@@ -1396,7 +1396,8 @@ void ProviderRouter::chatStream(const Config& cfg,
                                  const std::string& anthropic_body,
                                  const GatewayRequestContext& request_context,
                                  std::shared_ptr<StreamBuffer> out_buf,
-                                 int& out_status_code)
+                                 int& out_status_code,
+                                 std::function<bool()> downstream_closed)
 {
     out_status_code = 503;
     try {
@@ -1583,9 +1584,21 @@ void ProviderRouter::chatStream(const Config& cfg,
 
         {
             std::unique_lock<std::mutex> lock(start_state->mtx);
-            start_state->cv.wait(lock, [&]() {
-                return start_state->ready;
-            });
+            while (!start_state->ready) {
+                if (start_state->cv.wait_for(lock, std::chrono::milliseconds(100), [&]() {
+                        return start_state->ready;
+                    })) {
+                    break;
+                }
+
+                if (downstream_closed && downstream_closed()) {
+                    lock.unlock();
+                    stream_control->cancel();
+                    finish_stream(out_buf, false);
+                    out_status_code = 499;
+                    return;
+                }
+            }
             out_status_code = start_state->status_code;
         }
 

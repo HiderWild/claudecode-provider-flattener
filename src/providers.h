@@ -162,7 +162,8 @@ public:
                     const std::string& anthropic_body,
                     const GatewayRequestContext& request_context,
                     std::shared_ptr<StreamBuffer> out_buf,
-                    int& out_status_code);
+                    int& out_status_code,
+                    std::function<bool()> downstream_closed = {});
 
     // List available models from configured aliases and internal models
     std::string listModels(const Config& cfg);

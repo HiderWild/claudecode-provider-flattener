@@ -10,6 +10,7 @@
 #include <vector>
 #include <thread>
 #include <chrono>
+#include <cstdio>
 // httplib must be included before windows.h on Windows (it handles winsock2.h order)
 #include <httplib.h>
 #include <windows.h>
@@ -41,6 +42,8 @@ static std::mutex g_runtime_log_mutex;
 static bool g_console_visible = false;
 static HANDLE g_instance_lock_handle = INVALID_HANDLE_VALUE;
 static std::wstring g_instance_lock_path;
+static httplib::Server* g_console_control_server = nullptr;
+static std::atomic<DWORD> g_console_shutdown_event{0};
 
 struct MonitorCounters {
     std::atomic<uint64_t> total_requests{0};
@@ -116,6 +119,53 @@ static std::wstring get_runtime_directory_w() {
 
 static std::string get_runtime_log_path() {
     return HttpClient::wide_to_utf8(get_runtime_directory_w()) + "/model-gateway.log";
+}
+
+static const char* console_shutdown_event_name(DWORD ctrl_type) {
+    switch (ctrl_type) {
+        case CTRL_C_EVENT:
+            return "CTRL_C_EVENT";
+        case CTRL_BREAK_EVENT:
+            return "CTRL_BREAK_EVENT";
+        case CTRL_CLOSE_EVENT:
+            return "CTRL_CLOSE_EVENT";
+        case CTRL_LOGOFF_EVENT:
+            return "CTRL_LOGOFF_EVENT";
+        case CTRL_SHUTDOWN_EVENT:
+            return "CTRL_SHUTDOWN_EVENT";
+        default:
+            return "UNKNOWN_CONSOLE_EVENT";
+    }
+}
+
+static BOOL WINAPI handle_console_shutdown(DWORD ctrl_type) {
+    switch (ctrl_type) {
+        case CTRL_C_EVENT:
+        case CTRL_BREAK_EVENT:
+        case CTRL_CLOSE_EVENT:
+        case CTRL_LOGOFF_EVENT:
+        case CTRL_SHUTDOWN_EVENT:
+            g_console_shutdown_event.store(ctrl_type, std::memory_order_relaxed);
+            if (g_console_control_server) {
+                g_console_control_server->stop();
+            }
+            return TRUE;
+        default:
+            return FALSE;
+    }
+}
+
+static void detach_from_console_if_needed(bool show_console) {
+    if (show_console) {
+        return;
+    }
+
+    FreeConsole();
+
+    FILE* ignored = nullptr;
+    freopen_s(&ignored, "NUL", "r", stdin);
+    freopen_s(&ignored, "NUL", "w", stdout);
+    freopen_s(&ignored, "NUL", "w", stderr);
 }
 
 static std::string get_home_directory() {
@@ -713,6 +763,7 @@ static bool parse_startup_options(int argc, char* argv[], StartupOptions& option
 static int run_gateway_server(const StartupOptions& options) {
     const bool show_console = options.show_console;
     g_console_visible = show_console;
+    detach_from_console_if_needed(show_console);
 
     if (show_console) {
         SetConsoleOutputCP(CP_UTF8);
@@ -748,6 +799,16 @@ static int run_gateway_server(const StartupOptions& options) {
              std::to_string(g_config.models.size()) + " model(s)", show_console);
 
     httplib::Server svr;
+    g_console_shutdown_event.store(0, std::memory_order_relaxed);
+    g_console_control_server = &svr;
+    struct ConsoleHandlerGuard {
+        ~ConsoleHandlerGuard() {
+            g_console_control_server = nullptr;
+            g_console_shutdown_event.store(0, std::memory_order_relaxed);
+            SetConsoleCtrlHandler(handle_console_shutdown, FALSE);
+        }
+    } console_handler_guard;
+    SetConsoleCtrlHandler(handle_console_shutdown, TRUE);
     svr.set_socket_options([](socket_t sock) {
         httplib::set_socket_opt(sock, SOL_SOCKET, SO_REUSEADDR, 0);
 #ifdef SO_EXCLUSIVEADDRUSE
@@ -809,6 +870,13 @@ static int run_gateway_server(const StartupOptions& options) {
     }
 
     if (!svr.listen(addr, port)) {
+        const DWORD shutdown_event = g_console_shutdown_event.load(std::memory_order_relaxed);
+        if (shutdown_event != 0) {
+            log_info(std::string("[gateway] shutdown requested (") +
+                         console_shutdown_event_name(shutdown_event) + ")",
+                     show_console);
+            return 0;
+        }
         log_error("[gateway] failed to start on " + addr + ":" + std::to_string(port),
                   show_console);
         return 1;
@@ -1202,7 +1270,9 @@ static void handle_messages(const httplib::Request& req, httplib::Response& res)
         int status_code = 503;
 
         // Start backend request in background
-        ProviderRouter::instance().chatStream(cfg, req.body, request_context, buf, status_code);
+        ProviderRouter::instance().chatStream(cfg, req.body, request_context, buf, status_code, [&req]() {
+            return req.is_connection_closed && req.is_connection_closed();
+        });
 
         if (status_code >= 400) {
             std::string error_payload;
@@ -1395,6 +1465,7 @@ static void handle_get_monitor(const httplib::Request& req, httplib::Response& r
         {"active_streams", streams.size()},
         {"buffered_bytes", total_buffered_bytes},
         {"configured_thread_pool_size", cfg.thread_pool_size},
+        {"current_thread_pool_size", ServerThreadPool::currentWorkerCount()},
         {"effective_thread_pool_size", g_effective_thread_pool_size},
         {"thread_pool_mode", cfg.thread_pool_size == 0 ? "unbounded" : "fixed"},
         {"console_visible", g_console_visible},
