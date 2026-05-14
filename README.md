@@ -131,8 +131,8 @@ On macOS and Windows, a second gateway instance now fails fast instead of sharin
 
 GitHub Actions currently uses two release workflows:
 
-- Windows release: [release-windows.yml](.github/workflows/release-windows.yml) runs on `windows-latest`, configures CMake with the Visual Studio generator (`-A x64`), builds `Release`, runs `ctest -C Release`, then publishes a versioned `.exe` and `.zip`.
-- macOS ARM64 release: [release-macos-arm64.yml](.github/workflows/release-macos-arm64.yml) runs on `macos-14`, which is GitHub's Apple Silicon runner, builds with Apple Clang + CMake, runs `ctest`, then publishes a versioned binary and `.tar.gz` package.
+- Windows release: [release-windows.yml](.github/workflows/release-windows.yml) runs a matrix on `windows-2025-vs2026` and `windows-11-arm`, configures CMake with the Visual Studio generator (`-A x64` or `-A ARM64`), builds `Release`, runs `ctest -C Release`, then publishes versioned `.exe` and `.zip` assets for both Windows x64 and Windows ARM64.
+- macOS release: [release-macos-arm64.yml](.github/workflows/release-macos-arm64.yml) runs a matrix on `macos-14` and `macos-15-intel`, builds with Apple Clang + CMake, runs `ctest`, then publishes versioned binaries and `.tar.gz` packages for both macOS ARM64 and macOS Intel.
 
 Both workflows trigger on `v*` tags and can also be run manually through `workflow_dispatch`.
 
@@ -310,11 +310,11 @@ Compared with a generic API proxy:
 
 ## Releases
 
-GitHub Actions includes a Windows x64 release workflow. Tag a release with a `v*` tag such as `v1.0.0` and the workflow will:
+GitHub Actions includes release workflows for Windows x64, Windows ARM64, macOS ARM64, and macOS Intel. Tag a release with a `v*` tag such as `v1.0.0` and the workflows will:
 
-- build `model-gateway.exe` in Release mode
-- package the executable with the README and launcher helpers
-- upload the Windows x64 archive to the GitHub Release page
+- build release binaries for all four targets
+- package each binary with the README and platform-specific launcher helpers
+- upload the generated archives to the GitHub Release page
 
 ## Roadmap
 

@@ -1,4 +1,4 @@
-name: release-macos-arm64
+name: release-macos
 
 on:
   push:
@@ -11,7 +11,18 @@ permissions:
 
 jobs:
   build-release:
-    runs-on: macos-14
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-14
+            asset_suffix: macos-arm64
+            build_dir: build-macos-arm64
+          - runner: macos-15-intel
+            asset_suffix: macos-intel
+            build_dir: build-macos-intel
+
+    runs-on: ${{ matrix.runner }}
 
     steps:
       - name: Check out repository
@@ -25,23 +36,23 @@ jobs:
           else
             version="manual-${{ github.run_number }}"
           fi
-          asset_stem="claudecode-provider-flattener-${version}-macos-arm64"
+          asset_stem="claudecode-provider-flattener-${version}-${{ matrix.asset_suffix }}"
           echo "ASSET_STEM=$asset_stem" >> "$GITHUB_ENV"
           echo "asset_stem=$asset_stem" >> "$GITHUB_OUTPUT"
 
       - name: Configure CMake
-        run: cmake -B build-macos -S . -DCMAKE_BUILD_TYPE=Release
+        run: cmake -B "${{ matrix.build_dir }}" -S . -DCMAKE_BUILD_TYPE=Release
 
       - name: Build Release
-        run: cmake --build build-macos --parallel
+        run: cmake --build "${{ matrix.build_dir }}" --parallel
 
       - name: Run tests
-        run: ctest --test-dir build-macos --output-on-failure
+        run: ctest --test-dir "${{ matrix.build_dir }}" --output-on-failure
 
       - name: Prepare package
         run: |
           mkdir -p dist
-          install -m 755 build-macos/model-gateway "dist/$ASSET_STEM"
+          install -m 755 "${{ matrix.build_dir }}/model-gateway" "dist/$ASSET_STEM"
           install -m 644 README.md dist/README.md
           install -m 755 darwin/install-launchd.sh dist/install-launchd.sh
           install -m 644 darwin/com.claudecode.model-gateway.plist.template dist/com.claudecode.model-gateway.plist.template

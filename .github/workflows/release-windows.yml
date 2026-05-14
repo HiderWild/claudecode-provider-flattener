@@ -11,7 +11,18 @@ permissions:
 
 jobs:
   build-release:
-    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: windows-2025-vs2026
+            cmake_arch: x64
+            asset_suffix: windows-x64
+          - runner: windows-11-arm
+            cmake_arch: ARM64
+            asset_suffix: windows-arm64
+
+    runs-on: ${{ matrix.runner }}
 
     steps:
       - name: Check out repository
@@ -26,12 +37,12 @@ jobs:
           } else {
             $version = "manual-${{ github.run_number }}"
           }
-          $assetStem = "claudecode-provider-flattener-$version-windows-x64"
+          $assetStem = "claudecode-provider-flattener-$version-${{ matrix.asset_suffix }}"
           "ASSET_STEM=$assetStem" >> $env:GITHUB_ENV
           "asset_stem=$assetStem" >> $env:GITHUB_OUTPUT
 
       - name: Configure CMake
-        run: cmake -B build -S . -A x64
+        run: cmake -B build -S . -A ${{ matrix.cmake_arch }}
 
       - name: Build Release
         run: cmake --build build --config Release
